@@ -92,6 +92,7 @@ struct wd_ctx {
 	handle_t ctx;
 	__u8 op_type;
 	__u8 ctx_mode;
+	__u8 ctx_type;
 };
 
 /**
@@ -130,9 +131,20 @@ struct wd_ctx_config {
  * @async_ctx_num: The ctx numbers which are used for async mode for each
  * ctx sets.
  */
+/* 0x0 mean calloc init value */
+enum wd_ctx_property {
+	UADK_CTX_HW = 0x0,
+	UADK_CTX_CE_INS = 0x1,
+	UADK_CTX_SVE_INS = 0x2,
+	UADK_CTX_SOFT = 0x3,
+	UADK_CTX_MAX
+};
 struct wd_ctx_nums {
 	__u32 sync_ctx_num;
 	__u32 async_ctx_num;
+t__u8 ctx_prop;
+	__u16 ctx_begin;
+	struct wd_ctx_nums *other_ctx;
 };
 
 /**

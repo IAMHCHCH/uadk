@@ -61,6 +61,13 @@ struct wd_datalist {
 	struct wd_datalist *next;
 };
 
+struct wd_sched_params {
+	__u32 pkt_size;
+	__u16 data_mode;
+	__u16 prio_mode;
+};
+};
+
 #ifdef __cplusplus
 }
 #endif
