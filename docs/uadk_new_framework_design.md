@@ -9,6 +9,69 @@
 
 ## 第一章：框架层要解决什么问题
 
+### 1.0 UADK 是什么
+
+UADK（User-space Accelerator Development Kit）是一个面向 ARM Linux 的用户态硬件加速框架。它在统一 API 背后抽象了**华为鲲鹏密码学/压缩加速器**和 **ARM ISA 扩展指令集**（CE、SVE）。应用程序调用诸如 `wd_do_cipher_sync()` 的函数时，无需了解任务实际是在硬件引擎、ARM 密码指令还是软件回退上执行的。
+
+```
++------------------------------------------------------------------+
+|                     用户应用程序                                    |
+|   wd_cipher_init() / wd_cipher_alloc_sess() / wd_do_cipher_sync() |
++------------------------------------------------------------------+
+        |                              |
+        |  wd_init_attrs              |  wd_cipher_msg
+        v                              v
++------------------------------------------------------------------+
+|  API 层（算法接口层）                                               |
+|  wd_cipher.c  wd_digest.c  wd_aead.c  wd_comp.c  wd_rsa.c ...    |
+|                                                                   |
+|  职责：                                                            |
+|  - Session 管理（分配/释放/设置密钥）                                |
+|  - 同步/异步任务提交与完成轮询                                       |
+|   - 构造 wd_init_attrs 并调用统一初始化流水线                        |
+|  - V1（wd_<alg>_init）与 V2（wd_<alg>_init2_）路径选择             |
++------------------------------------------------------------------+
+        |                              |
+        |  wd_alg_attrs_init()        |  sched->pick_next_ctx()
+        |  wd_ctx_bind_drivers()      |  ctx->drv->send()
+        |  wd_alg_init_driver()       |  wd_get_compat_ctxs()
+        v                              v
++------------------------------------------------------------------+
+|  框架层（核心层）                                                   |
+|                                                                  |
+|  wd_alg.c    — 驱动注册与发现（Phase 1）                            |
+|  wd_util.c   — 统一 4 阶段初始化流水线（Phase 2/2.5/3）              |
+|  wd_drv.c    — Ctx 分配与软队列辅助函数                              |
+|  wd_sched.c  — 调度器实现（RR/LOOP/HUNGRY/...）                     |
+|  wd.c        — UACCE 封装（sysfs、ctx open/mmap/ioctl/poll）       |
+|  wd_mempool.c — 内存池管理                                         |
+|  wd_bmm.c    — 缓冲内存管理（No-SVA 安全检查）                       |
++------------------------------------------------------------------+
+        |                              |
+        |  wd_alg_driver_register()   |  drv->send() / drv->recv()
+        |  drv->init() / drv->exit()  |  drv->alloc_ctx()
+        v                              v
++------------------------------------------------------------------+
+|  驱动层                                                           |
+|                                                                  |
+|  libhisi_sec.so  — 华为安全引擎（cipher/aead/digest）               |
+|  libhisi_hpre.so — 华为 HPRE（RSA/ECC/DH）                        |
+|  libhisi_zip.so  — 华为 ZIP（压缩）                                |
+|  libhisi_dae.so  — 华为 DAE（数据加速引擎）                         |
+|  libhisi_udma.so — 华为 UDMA                                      |
+|  libisa_ce.so    — ARM 密码扩展指令集（SM3/SM4）                    |
+|  libisa_sve.so   — ARM SVE 多缓冲哈希（SM3/MD5）                   |
++------------------------------------------------------------------+
+        |
+        |  ioctl / mmap on /dev/<uacce_device>
+        v
++------------------------------------------------------------------+
+|  Linux 内核（UACCE 子系统）                                         |
+|  /sys/class/uacce/<dev>/  +  /dev/<dev>                          |
++------------------------------------------------------------------+
+```
+
+
 ### 1.1 UADK 三层框架结构
 
 UADK 是一个用户态异构加速框架，按职责划分为三层：
