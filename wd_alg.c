@@ -271,7 +271,8 @@ int wd_alg_driver_register(struct wd_alg_driver *drv)
 	/* Search for an existing node with the same drv_name */
 	pthread_mutex_lock(&alg_registry.mutex);
 	while (node) {
-		if (strcmp(node->drv_name, drv->drv_name) == 0) {
+		if (strcmp(node->drv_name, drv->drv_name) == 0 &&
+		     strcmp(node->alg_type, alg_type) == 0) {
 			target_node = node;
 			break;
 		}
@@ -358,15 +359,23 @@ void wd_alg_driver_unregister(struct wd_alg_driver *drv)
 {
 	struct wd_drv_node *npre = alg_registry.head;
 	struct wd_drv_node *pnext = npre->next;
-	int i;
+	char alg_type[ALG_NAME_SIZE];
+	int i, ret;
 
 	if (!pnext || !drv)
 		return;
 
+	ret = wd_get_alg_type(drv->alg_name, alg_type);
+	if (ret) {
+		WD_ERR("failed to get alg_type for %s!\n", drv->alg_name);
+		return;
+	}
+
 	pthread_mutex_lock(&alg_registry.mutex);
 	/* Find the driver node matching drv_name */
 	while (pnext) {
-		if (strcmp(drv->drv_name, pnext->drv_name) == 0)
+		if (strcmp(drv->drv_name, pnext->drv_name) == 0 &&
+		     strcmp(pnext->alg_type, alg_type) == 0)
 			break;
 		npre = pnext;
 		pnext = pnext->next;
