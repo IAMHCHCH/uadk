@@ -1012,7 +1012,7 @@ static int wd_sched_poll_skey(struct wd_sched_ctx *sched_ctx, struct wd_sched_ke
 
 		/* Update load value for this context */
 		if (skey->async_domain.idx_cache.policy == SCHED_POLICY_HUNGRY)
-			wd_sched_skey_update_load(&skey->async_domain.idx_cache, i, poll_num);
+			wd_sched_skey_update_load(&skey->async_domain.idx_cache, i, -poll_num);
 	}
 	*count = sum_poll_num;
 
