@@ -377,10 +377,6 @@ static int wd_cipher_common_init(struct wd_ctx_config *config,
 
 	wd_cipher_setting.priv = STATUS_ENABLE;
 
-	/* V2 path: let framework know where the internal config is */
-	if (cipher_attrs)
-		cipher_attrs->ctx_config_internal = &wd_cipher_setting.config;
-
 	return 0;
 
 out_clear_sched:

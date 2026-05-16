@@ -2345,157 +2345,242 @@ int wd_alg_drv_discover(struct wd_init_attrs *attrs)
 	return 0;
 }
 
+static int wd_alloc_ctxs_by_mode(struct wd_ctx_config_internal *internal_config,
+				   struct wd_init_attrs *attrs,
+				   __u8 ctx_mode,
+				   __u32 *ctx_idx_out)
+{
+	struct wd_ctx_params *ctx_params = attrs->ctx_params;
+	struct wd_alg_driver **drv_array = attrs->drv_array;
+	__u32 drv_count = attrs->drv_count;
+	const char *alg = attrs->alg;
+	struct wd_drv_ctx_params dparams;
+	struct wd_alg_driver *drv;
+	handle_t ctx;
+	__u32 i, op_type;
+	__u32 allocated = 0;
+	int ret;
+
+	for (op_type = 0; op_type < ctx_params->op_type_num; op_type++) {
+		__u32 num = (ctx_mode == CTX_MODE_SYNC) ?
+			    ctx_params->ctx_set_num[op_type].sync_ctx_num :
+			    ctx_params->ctx_set_num[op_type].async_ctx_num;
+
+		for (i = 0; i < num; i++) {
+			__u32 drv_idx = i % drv_count;
+			__u32 ctx_idx = *ctx_idx_out;
+
+			drv = drv_array[drv_idx];
+			if (!drv || !drv->alloc_ctx) {
+				WD_ERR("Warning: driver-%s alloc_ctx is NULL!\n",
+				       drv ? drv->drv_name : "null");
+				continue;
+			}
+
+			memset(&dparams, 0, sizeof(dparams));
+			dparams.ctx_mode = ctx_mode;
+			dparams.op_type = op_type;
+			dparams.numa_id = 0;
+			dparams.idx = ctx_idx;
+			dparams.bmp = ctx_params->bmp;
+			dparams.epoll_en = false;
+
+			ret = drv->alloc_ctx(alg, &dparams, &ctx);
+			if (!ctx || ret) {
+				WD_ERR("driver %u (%s) alloc_ctx failed for ctx %u\n",
+				       drv_idx, drv->drv_name, ctx_idx);
+				return -WD_ENOMEM;
+			}
+
+			internal_config->ctxs[ctx_idx].ctx = ctx;
+			internal_config->ctxs[ctx_idx].op_type = op_type;
+			internal_config->ctxs[ctx_idx].ctx_mode = ctx_mode;
+			internal_config->ctxs[ctx_idx].ctx_type = drv->calc_type;
+			internal_config->ctxs[ctx_idx].drv = drv;
+
+			(*ctx_idx_out)++;
+			allocated++;
+		}
+	}
+
+	return allocated;
+}
+
+static int wd_alloc_ctxs_batch(struct wd_ctx_config_internal *internal_config,
+				struct wd_init_attrs *attrs)
+{
+	struct wd_ctx_params *ctx_params = attrs->ctx_params;
+	struct wd_alg_driver **drv_array = attrs->drv_array;
+	__u32 drv_count = attrs->drv_count;
+	const char *alg = attrs->alg;
+	__u32 sync_num = 0, async_num = 0;
+	__u32 ctx_idx = 0;
+	__u32 sync_allocated, async_allocated;
+	int ret;
+
+	/* Calculate sync/async counts */
+	for (int i = 0; i < ctx_params->op_type_num; i++) {
+		sync_num += ctx_params->ctx_set_num[i].sync_ctx_num;
+		async_num += ctx_params->ctx_set_num[i].async_ctx_num;
+	}
+
+	/*
+	 * Allocation strategy:
+	 * 1. First allocate all sync ctxs (ctx 0 ~ sync_num-1)
+	 * 2. Then allocate all async ctxs (ctx sync_num ~ total-1)
+	 * This ensures sync ctxs and async ctxs are each contiguous.
+	 */
+
+	ret = wd_alloc_ctxs_by_mode(internal_config, attrs, CTX_MODE_SYNC, &ctx_idx);
+	if (ret < 0)
+		return ret;
+	sync_allocated = ret;
+
+	ret = wd_alloc_ctxs_by_mode(internal_config, attrs, CTX_MODE_ASYNC, &ctx_idx);
+	if (ret < 0)
+		return ret;
+	async_allocated = ret;
+
+	WD_INFO("Allocated %u sync + %u async = %u ctxs\n",
+		sync_allocated, async_allocated, ctx_idx);
+
+	return 0;
+}
+
+static void wd_free_ctxs_batch(struct wd_ctx_config_internal *internal_config,
+				struct wd_init_attrs *attrs)
+{
+	struct wd_alg_driver *drv;
+	__u32 i;
+
+	if (!internal_config || !internal_config->ctxs)
+		return;
+
+	for (i = 0; i < internal_config->ctx_num; i++) {
+		if (!internal_config->ctxs[i].ctx)
+			continue;
+
+		/* Use stored drv pointer from allocation */
+		drv = internal_config->ctxs[i].drv;
+		if (drv && drv->free_ctx) {
+			drv->free_ctx(internal_config->ctxs[i].ctx);
+			internal_config->ctxs[i].ctx = 0;
+		}
+	}
+}
+
 static int wd_alg_sched_instance(struct wd_sched *sched,
-                                 struct wd_ctx_config *ctx_config,
+                                 struct wd_ctx_config_internal *internal_config,
                                  struct wd_ctx_params *ctx_params)
 {
 	struct sched_params sparams;
-	__u32 sync_count, async_count, total_count;
-	__u32 i, sync_offset, async_offset;
+	__u32 i = 0;
 	int ret;
 
-	if (!sched || !ctx_config || !ctx_params) {
-		WD_ERR("invalid: sched, ctx_config, or ctx_params is NULL!\n");
+	if (!sched || !internal_config || !ctx_params) {
+		WD_ERR("invalid: sched, internal_config, or ctx_params is NULL!\n");
 		return -WD_EINVAL;
 	}
 
-	/* Calculate total sync/async context counts */
-	sync_count = 0;
-	async_count = 0;
-
-	for (i = 0; i < ctx_params->op_type_num; i++) {
-		sync_count += ctx_params->ctx_set_num[i].sync_ctx_num;
-		async_count += ctx_params->ctx_set_num[i].async_ctx_num;
-	}
-
-	total_count = sync_count + async_count;
-
-	if (total_count != ctx_config->ctx_num) {
-		WD_ERR("mismatch: expected %u contexts, got %u!\n",
-		       total_count, ctx_config->ctx_num);
+	if (!internal_config->ctxs) {
+		WD_ERR("invalid: internal_config->ctxs is NULL!\n");
 		return -WD_EINVAL;
 	}
 
-	WD_INFO("Registering contexts: sync=%u, async=%u, total=%u\n",
-	        sync_count, async_count, total_count);
+	WD_INFO("Registering %u internal contexts into scheduler\n",
+		internal_config->ctx_num);
 
-	/* Register each ctx_set_num entry as a separate scheduling domain
-	 * with its own op_type, ctx_prop, and numa_id.
-	 * Memory layout: [sync ctxs for all entries]...[async ctxs for all entries]
+	/* Walk the internal ctx array and register contiguous segments
+	 * per (ctx_mode, op_type, ctx_type) tuple.
 	 */
-	sync_offset = 0;
-	async_offset = sync_count;
+	while (i < internal_config->ctx_num) {
+		__u8 mode = internal_config->ctxs[i].ctx_mode;
+		__u32 type = internal_config->ctxs[i].op_type;
+		__u8 ctx_type = internal_config->ctxs[i].ctx_type;
+		__u32 seg_begin = i;
 
-	for (i = 0; i < ctx_params->op_type_num; i++) {
-		__u32 s_num = ctx_params->ctx_set_num[i].sync_ctx_num;
-		__u32 a_num = ctx_params->ctx_set_num[i].async_ctx_num;
+		/* Find end of this contiguous run */
+		while (i < internal_config->ctx_num &&
+		       internal_config->ctxs[i].ctx_mode == mode &&
+		       internal_config->ctxs[i].op_type == type &&
+		       internal_config->ctxs[i].ctx_type == ctx_type)
+			i++;
 
-		/* Register sync contexts range */
-		if (s_num > 0) {
-			memset(&sparams, 0, sizeof(sparams));
-			sparams.numa_id = 0;
-			sparams.type = i;
-			sparams.mode = CTX_MODE_SYNC;
-			sparams.begin = sync_offset;
-			sparams.end = sync_offset + s_num - 1;
-			sparams.ctx_prop = ctx_params->ctx_set_num[i].ctx_prop;
-			sparams.dev_id = 0;
+		memset(&sparams, 0, sizeof(sparams));
+		sparams.numa_id = 0;
+		sparams.type = type;
+		sparams.mode = mode;
+		sparams.begin = seg_begin;
+		sparams.end = i - 1;
+		sparams.ctx_prop = ctx_type;
+		sparams.dev_id = 0;
 
-			ret = wd_sched_rr_instance(sched, &sparams);
-			if (ret) {
-				WD_ERR("failed to register sync contexts (entry %u) to scheduler!\n", i);
-				return ret;
-			}
-
-			sync_offset += s_num;
+		ret = wd_sched_rr_instance(sched, &sparams);
+		if (ret) {
+			WD_ERR("failed to register ctx range [%u, %u] "
+			       "(op_type=%u, mode=%u, ctx_prop=%d)\n",
+			       seg_begin, i - 1, type, mode, ctx_type);
+			return ret;
 		}
 
-		/* Register async contexts range */
-		if (a_num > 0) {
-			memset(&sparams, 0, sizeof(sparams));
-			sparams.numa_id = 0;
-			sparams.type = i;
-			sparams.mode = CTX_MODE_ASYNC;
-			sparams.begin = async_offset;
-			sparams.end = async_offset + a_num - 1;
-			sparams.ctx_prop = ctx_params->ctx_set_num[i].ctx_prop;
-			sparams.dev_id = 0;
-
-			ret = wd_sched_rr_instance(sched, &sparams);
-			if (ret) {
-				WD_ERR("failed to register async contexts (entry %u) to scheduler!\n", i);
-				return ret;
-			}
-
-			async_offset += a_num;
-		}
-
-		WD_INFO("Registered entry %u: sync=%u, async=%u, prop=%d\n",
-			i, s_num, a_num, ctx_params->ctx_set_num[i].ctx_prop);
+		WD_INFO("Registered range [%u, %u]: op_type=%u, mode=%u, "
+			"ctx_prop=%d\n", seg_begin, i - 1,
+			type, mode, ctx_type);
 	}
 
 	return 0;
 }
 
 /**
- * wd_alg_ctx_uninit() - Release ctxs, scheduler, ctx_config.
+ * wd_alg_ctx_uninit() - Release ctxs, scheduler, ctx_config and internal_config.
  *
  * Releases resources in reverse allocation order:
- * 1. Release scheduler
- * 2. Release ctxs via RR rule (drv->free_ctx)
- * 3. Free ctx_config and ctxs array
+ * 1. Free ctx_config + wd_ctx[] (AUXILIARY)
+ * 2. Call wd_free_ctxs_batch() to release all ctxs
+ * 3. Free internal_config + wd_ctx_internal[] (PRIMARY)
+ * 4. Release scheduler
  *
  * @attrs: Initialization attributes
  */
 void wd_alg_ctx_uninit(struct wd_init_attrs *attrs)
 {
 	struct wd_ctx_config *ctx_config;
-	struct wd_alg_driver *drv;
-	__u32 i, drv_idx;
+	struct wd_ctx_config_internal *internal_config;
 
 	if (!attrs)
 		return;
 
 	ctx_config = attrs->ctx_config;
+	internal_config = attrs->ctx_config_internal;
 
-	WD_INFO("Phase 1： wd_alg_ctx_uninit\n");
-	/* Release scheduler */
+	WD_INFO("wd_alg_ctx_uninit: starting\n");
+
+	/* Step 1: Free ctx_config + wd_ctx[] (AUXILIARY) */
+	if (ctx_config) {
+		free(ctx_config->ctxs);
+		free(ctx_config);
+		attrs->ctx_config = NULL;
+	}
+
+	/* Step 2: Free all contexts via wd_free_ctxs_batch() */
+	if (internal_config && attrs->drv_array && attrs->drv_count > 0) {
+		wd_free_ctxs_batch(internal_config, attrs);
+	}
+
+	/* Step 3: Free internal_config + wd_ctx_internal[] (PRIMARY) */
+	if (internal_config) {
+		free(internal_config->ctxs);
+		free(internal_config);
+		attrs->ctx_config_internal = NULL;
+	}
+
+	/* Step 4: Release scheduler */
 	if (attrs->sched) {
 		wd_sched_rr_release(attrs->sched);
 		attrs->sched = NULL;
 	}
 
-	/* Release ctxs via RR rule */
-	if (ctx_config && ctx_config->ctxs && attrs->drv_array &&
-	    attrs->drv_count > 0) {
-		for (i = 0; i < ctx_config->ctx_num; i++) {
-			if (!ctx_config->ctxs[i].ctx)
-				continue;
-
-			drv_idx = i % attrs->drv_count;
-			drv = attrs->drv_array[drv_idx];
-
-			if (drv && drv->free_ctx) {
-				drv->free_ctx(ctx_config->ctxs[i].ctx);
-				ctx_config->ctxs[i].ctx = 0;
-				WD_INFO("Phase 2： free drv--<%s>, ctx<%u>\n", drv->drv_name, i);
-			}
-		}
-	}
-
-	/* Release ctx_config */
-	if (ctx_config) {
-		if (ctx_config->ctxs) {
-			free(ctx_config->ctxs);
-			ctx_config->ctxs = NULL;
-		}
-		free(ctx_config);
-		attrs->ctx_config = NULL;
-	}
-
-	attrs->ctx_config_internal = NULL;
-
-	WD_INFO("Phase 3 reverse: ctx uninit complete\n");
+	WD_INFO("wd_alg_ctx_uninit: complete\n");
 }
 
 /**
@@ -2519,17 +2604,12 @@ void wd_alg_ctx_uninit(struct wd_init_attrs *attrs)
 int wd_alg_ctx_init(struct wd_init_attrs *attrs)
 {
 	struct wd_ctx_config *ctx_config;
+	struct wd_ctx_config_internal *internal_config;
 	struct wd_ctx_params *ctx_params;
-	struct wd_drv_ctx_params dparams;
-	struct wd_alg_driver *drv;
-	handle_t ctx;
 	__u32 sync_num = 0, async_num = 0;
 	__u32 total_ctx_num = 0;
-	__u32 ctx_idx, drv_idx;
-	__u32 i, op_type;
+	__u32 i;
 	__u16 region_num;
-	__u32 accum = 0;
-	__u32 cnt;
 	int ret;
 
 	if (!attrs || !attrs->ctx_params || !attrs->drv_array ||
@@ -2552,75 +2632,32 @@ int wd_alg_ctx_init(struct wd_init_attrs *attrs)
 		return -WD_EINVAL;
 	}
 
-	/* Allocate ctx_config structure */
-	ctx_config = calloc(1, sizeof(*ctx_config));
-	if (!ctx_config) {
-		WD_ERR("failed to allocate ctx_config!\n");
-		return -WD_ENOMEM;
-	}
-
-	/* Allocate user-visible wd_ctx array (no drv pointer — ABI safe) */
-	ctx_config->ctxs = calloc(total_ctx_num, sizeof(struct wd_ctx));
-	if (!ctx_config->ctxs) {
-		WD_ERR("failed to allocate ctxs array!\n");
-		free(ctx_config);
-		return -WD_ENOMEM;
-	}
-	ctx_config->ctx_num = total_ctx_num;
-	attrs->ctx_config = ctx_config;
-
 	WD_INFO("Phase 2: %u drivers, %u ctxs (sync=%u, async=%u)\n",
 		attrs->drv_count, total_ctx_num, sync_num, async_num);
 
-	/* ── RR allocation loop ── */
-	for (ctx_idx = 0; ctx_idx < total_ctx_num; ctx_idx++) {
-		drv_idx = ctx_idx % attrs->drv_count;
-		drv = attrs->drv_array[drv_idx];
-
-		if (!drv || !drv->alloc_ctx) {
-			WD_ERR("Warning: driver-%s alloc_ctx is NULL!\n", drv->drv_name);
-			continue;
-		}
-
-		WD_ERR("------driver<%s> alloc ctx<%u>\n", drv->drv_name, ctx_idx);
-		/* Determine op_type for this ctx index */
-		op_type = 0;
-		accum = 0;
-		for (i = 0; i < ctx_params->op_type_num; i++) {
-			cnt = ctx_params->ctx_set_num[i].sync_ctx_num +
-				    ctx_params->ctx_set_num[i].async_ctx_num;
-			if (ctx_idx < accum + cnt) {
-				op_type = i;
-				break;
-			}
-			accum += cnt;
-		}
-
-		/* Fill driver ctx params */
-		memset(&dparams, 0, sizeof(dparams));
-		dparams.ctx_mode = (ctx_idx < sync_num) ?
-				   CTX_MODE_SYNC : CTX_MODE_ASYNC;
-		dparams.op_type = (__u16)op_type;
-		dparams.numa_id = 0;       /* Scheduler handles NUMA at runtime */
-		dparams.idx = ctx_idx;
-		dparams.bmp = ctx_params->bmp;
-		dparams.epoll_en = false;
-
-		/* Call driver's alloc_ctx — driver owns the implementation */
-		ret = drv->alloc_ctx(attrs->alg, &dparams, &ctx);
-		if (!ctx || ret) {
-			WD_ERR("driver %u (%s) alloc_ctx failed for ctx %u\n",
-			       drv_idx, drv->drv_name, ctx_idx);
-			goto cleanup_ctxs;
-		}
-
-		/* Store in user-visible ctx_config */
-		ctx_config->ctxs[ctx_idx].ctx = ctx;
-		ctx_config->ctxs[ctx_idx].op_type = dparams.op_type;
-		ctx_config->ctxs[ctx_idx].ctx_mode = dparams.ctx_mode;
+	/* Step 1: Allocate internal_config + wd_ctx_internal[] (PRIMARY) */
+	internal_config = calloc(1, sizeof(*internal_config));
+	if (!internal_config) {
+		WD_ERR("failed to allocate internal_config!\n");
+		return -WD_ENOMEM;
 	}
 
-	/* ── Allocate scheduler ── */
+	internal_config->ctxs = calloc(total_ctx_num, sizeof(struct wd_ctx_internal));
+	if (!internal_config->ctxs) {
+		WD_ERR("failed to allocate internal ctxs array!\n");
+		free(internal_config);
+		return -WD_ENOMEM;
+	}
+	internal_config->ctx_num = total_ctx_num;
+
+	/* Step 2: Allocate all contexts via wd_alloc_ctxs_batch() */
+	ret = wd_alloc_ctxs_batch(internal_config, attrs);
+	if (ret) {
+		WD_ERR("wd_alloc_ctxs_batch failed!\n");
+		goto cleanup_internal;
+	}
+
+	/* Step 3: Allocate scheduler */
 	if (attrs->sched_type == SCHED_POLICY_DEV)
 		region_num = DEVICE_REGION_MAX;
 	else
@@ -2633,57 +2670,71 @@ int wd_alg_ctx_init(struct wd_init_attrs *attrs)
 	if (!attrs->sched) {
 		WD_ERR("failed to allocate scheduler!\n");
 		ret = -WD_ENOMEM;
-		goto cleanup_ctxs;
+		goto cleanup_alloc;
 	}
 
-	/* ── Register contexts to scheduler ── */
-	ret = wd_alg_sched_instance(attrs->sched, ctx_config, ctx_params);
+	/* Step 4: Register contexts to scheduler using internal_config */
+	ret = wd_alg_sched_instance(attrs->sched, internal_config, ctx_params);
 	if (ret) {
 		WD_ERR("failed to register contexts to scheduler!\n");
 		goto cleanup_sched;
 	}
 
-	/* ── Call algorithm-specific init (does wd_init_ctx_config copy) ── */
-	ctx_config->cap = ctx_params->cap;
-	ret = attrs->alg_init(ctx_config, attrs->sched, attrs);
-	if (ret) {
-		WD_ERR("failed to initialize algorithm!\n");
+	/* Step 5: Allocate ctx_config + wd_ctx[] (AUXILIARY) */
+	ctx_config = calloc(1, sizeof(*ctx_config));
+	if (!ctx_config) {
+		WD_ERR("failed to allocate ctx_config!\n");
+		ret = -WD_ENOMEM;
 		goto cleanup_sched;
 	}
 
-	/*
-	 * IMPORTANT: attrs->ctx_config_internal must be set by alg_init.
-	 * The alg_init callback (e.g. wd_cipher_common_init) internally calls
-	 * wd_init_ctx_config() which creates the wd_ctx_config_internal.
-	 * The callback must store the pointer in attrs->ctx_config_internal.
-	 *
-	 * If the current alg_init signature doesn't pass attrs, it needs to
-	 * be updated. See "Required changes in other files" below.
-	 */
+	ctx_config->ctxs = calloc(total_ctx_num, sizeof(struct wd_ctx));
+	if (!ctx_config->ctxs) {
+		WD_ERR("failed to allocate ctxs array!\n");
+		free(ctx_config);
+		ret = -WD_ENOMEM;
+		goto cleanup_sched;
+	}
+	ctx_config->ctx_num = total_ctx_num;
 
-	WD_INFO("Phase 2 complete: %u ctxs from %u drivers
-",
+	/* Step 6: Copy internal data to ctx_config (for alg_init compatibility) */
+	for (i = 0; i < total_ctx_num; i++) {
+		ctx_config->ctxs[i].ctx = internal_config->ctxs[i].ctx;
+		ctx_config->ctxs[i].op_type = internal_config->ctxs[i].op_type;
+		ctx_config->ctxs[i].ctx_mode = internal_config->ctxs[i].ctx_mode;
+	}
+
+	attrs->ctx_config = ctx_config;
+	ctx_config->cap = ctx_params->cap;
+
+	/* Step 7: Call algorithm-specific init */
+	ret = attrs->alg_init(ctx_config, attrs->sched, attrs);
+	if (ret) {
+		WD_ERR("failed to initialize algorithm!\n");
+		goto cleanup_ctx_config;
+	}
+
+	/* Step 8: Save internal_config (both structures persist) */
+	attrs->ctx_config_internal = internal_config;
+
+	WD_INFO("Phase 2 complete: %u ctxs from %u drivers\n",
 		total_ctx_num, attrs->drv_count);
 
 	return 0;
 
-	/* ── Error cleanup (LIFO) ── */
-cleanup_sched:
-	wd_sched_rr_release(attrs->sched);
-	attrs->sched = NULL;
-cleanup_ctxs:
-	/* Free ctxs allocated so far using RR rule */
-	for (i = 0; i < ctx_idx; i++) {
-		drv_idx = i % attrs->drv_count;
-		drv = attrs->drv_array[drv_idx];
-		if (drv && drv->free_ctx && ctx_config->ctxs[i].ctx) {
-			drv->free_ctx(ctx_config->ctxs[i].ctx);
-			ctx_config->ctxs[i].ctx = 0;
-		}
-	}
+	/* Error cleanup (LIFO) */
+cleanup_ctx_config:
 	free(ctx_config->ctxs);
 	free(ctx_config);
 	attrs->ctx_config = NULL;
+cleanup_sched:
+	wd_sched_rr_release(attrs->sched);
+	attrs->sched = NULL;
+cleanup_alloc:
+	wd_free_ctxs_batch(internal_config, attrs);
+cleanup_internal:
+	free(internal_config->ctxs);
+	free(internal_config);
 	return ret;
 }
 
