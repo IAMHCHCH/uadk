@@ -103,6 +103,7 @@ struct uacce_dev_list *wd_get_usable_list(struct uacce_dev_list *list, struct bi
 
 out_free_node:
 	free(node);
+	return result;
 out_free_list:
 	wd_free_list_accels(result);
 	return result;
@@ -146,7 +147,7 @@ int wd_hw_alloc_ctx(char *alg_name, void *params, handle_t *ctx)
 
 	/* Get usable device list based on NUMA mask */
 	used_list = wd_get_usable_list(dev_list, used_bmp);
-	if (!used_list) {
+	if (WD_IS_ERR(used_list) || !used_list) {
 		WD_ERR("failed to get usable device list\n");
 		ret = -WD_ENODEV;
 		goto out;

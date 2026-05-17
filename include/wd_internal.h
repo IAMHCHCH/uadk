@@ -69,7 +69,6 @@ struct wd_sched_params {
 	const char *alg_name;
 	struct wd_ctx_internal *ctxs;
 };
-};
 
 #ifdef __cplusplus
 }

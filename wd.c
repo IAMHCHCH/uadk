@@ -811,7 +811,7 @@ void wd_free_list_accels(struct uacce_dev_list *list)
 {
 	struct uacce_dev_list *curr, *next;
 
-	if (!list)
+	if (WD_IS_ERR(list) || !list)
 		return;
 
 	curr = list;

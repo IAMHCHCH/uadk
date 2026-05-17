@@ -623,6 +623,7 @@ static void fill_request_msg(struct wd_cipher_msg *msg,
 	msg->data_fmt = req->data_fmt;
 	msg->mm_ops = &sess->mm_ops;
 	msg->mm_type = sess->mm_type;
+	msg->result = 0;
 }
 
 static int cipher_iv_len_check(struct wd_cipher_req *req,

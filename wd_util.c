@@ -1865,8 +1865,6 @@ int wd_ctx_param_init(struct wd_ctx_params *ctx_params,
 	ctx_params->op_type_num = max_op_type;
 
 	return 0;
-
-	return 0;
 }
 
 static void dladdr_empty(void)

@@ -1349,6 +1349,9 @@ static int round_robin_poll_policy(handle_t h_sched_ctx, __u32 expect, __u32 *co
 	__u32 tid = pthread_self();
 	__u16 i, tpos, start_pos;
 	__u32 poll_num, sum_count = 0;
+
+	if (unlikely(!skey_num))
+		return 0;
 	int ret;
 
 	if (unlikely(!count || !sched_ctx || !sched_ctx->poll_func)) {

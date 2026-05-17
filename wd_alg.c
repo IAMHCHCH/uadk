@@ -348,7 +348,7 @@ int wd_alg_driver_register(struct wd_alg_driver *drv)
 		/* Append to list tail */
 		alg_registry.tail->next = target_node;
 		alg_registry.tail = target_node;
-		alg_registry.drv_type_num++;
+		__atomic_fetch_add(&alg_registry.drv_type_num, 1, __ATOMIC_RELAXED);
 	}
 
 	pthread_mutex_unlock(&alg_registry.mutex);
@@ -408,7 +408,7 @@ void wd_alg_driver_unregister(struct wd_alg_driver *drv)
 		npre->next = pnext->next;
 		free(pnext);
 		if (alg_registry.drv_type_num > 0)
-			alg_registry.drv_type_num--;
+			__atomic_fetch_sub(&alg_registry.drv_type_num, 1, __ATOMIC_RELAXED);
 	}
 
 	pthread_mutex_unlock(&alg_registry.mutex);
@@ -700,7 +700,7 @@ int wd_get_drv_array(const char *alg_type, int task_type, char *drv_name,
 		return -WD_EINVAL;
 	}
 
-	max_driver_count = alg_registry.drv_type_num;
+	max_driver_count = __atomic_load_n(&alg_registry.drv_type_num, __ATOMIC_RELAXED);
 	WD_INFO("drivers list drv_type_num: %d\n", alg_registry.drv_type_num);
 
 	if (max_driver_count == 0) {
