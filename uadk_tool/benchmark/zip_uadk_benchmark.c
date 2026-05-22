@@ -806,11 +806,18 @@ static void free_uadk_bd_pool(void)
 static int init_uadk_rsv_pool(struct acc_option *option)
 {
 	struct wd_mempool_setup pool_setup;
-	char *alg = option->algclass;
+	char alg[CRYPTO_MAX_ALG_NAME];
 	u32 insize = g_pktlen;
 	handle_t h_ctx;
 	u32 outsize;
 	int i, j;
+
+	if (option->optype == 1)
+		snprintf(alg, CRYPTO_MAX_ALG_NAME - 1, "%s-decomp",
+			 option->algclass);
+	else
+		snprintf(alg, CRYPTO_MAX_ALG_NAME - 1, "%s-comp",
+			 option->algclass);
 
 	h_ctx = wd_find_ctx(alg);
 	if (!h_ctx) {
