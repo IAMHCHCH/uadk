@@ -27,6 +27,10 @@ extern "C" {
 	for ((i) = 0, (config_numa) = (config)->config_per_numa; \
 	     (i) < (config)->numa_num; (config_numa)++, (i)++)
 
+#define COMP_ALG	"comp"
+#define CTX_COMP_ALG "zlib-comp gzip-comp deflate-comp lz77_zstd-comp lz4-comp lz77_only-comp"
+#define CTX_DECOMP_ALG "zlib-decomp gzip-decomp deflate-decomp lz77_zstd-decomp lz4-decomp lz77_only-decomp"
+
 enum wd_status {
 	WD_UNINIT,
 	WD_INITING,

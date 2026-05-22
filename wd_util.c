@@ -242,6 +242,7 @@ int wd_init_ctx_config(struct wd_ctx_config_internal *in,
 		       struct wd_ctx_config *cfg)
 {
 	struct wd_ctx_internal *ctxs;
+	char *alg_name;
 	__u32 i, j;
 	int ret;
 
@@ -274,7 +275,15 @@ int wd_init_ctx_config(struct wd_ctx_config_internal *in,
 			goto err_out;
 		}
 
-		ret = wd_insert_ctx_list(cfg->ctxs[i].ctx, in->alg_name);
+		alg_name = in->alg_name;
+		if (strcmp(in->alg_name, COMP_ALG) == 0) {
+			if (cfg->ctxs[i].op_type == 0)
+				alg_name = CTX_COMP_ALG;
+			else
+				alg_name = CTX_DECOMP_ALG;
+		}
+
+		ret = wd_insert_ctx_list(cfg->ctxs[i].ctx, alg_name);
 		if (ret) {
 			WD_ERR("failed to add ctx to mem list!\n");
 			goto err_out;
