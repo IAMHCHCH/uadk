@@ -40,8 +40,8 @@ pkginclude_HEADERS = include/wd.h include/wd_internal.h include/wd_cipher.h incl
 		  include/wd_udma.h include/wd_join_gather.h \
 		  include/wd_bmm.h
 
-nobase_pkginclude_HEADERS = v1/wd.h v1/wd_cipher.h v1/wd_aead.h v1/uacce.h v1/wd_dh.h \
-			 v1/wd_digest.h v1/wd_rsa.h v1/wd_bmm.h
+nobase_pkginclude_HEADERS=v1/wd.h v1/wd_cipher.h v1/wd_aead.h v1/wd_dh.h v1/wd_digest.h \
+			  v1/wd_rsa.h v1/wd_bmm.h v1/wd_ecc.h v1/wd_comp.h
 
 lib_LTLIBRARIES=libwd.la libwd_comp.la libwd_crypto.la libwd_dae.la libwd_udma.la
 
