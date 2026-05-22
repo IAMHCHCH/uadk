@@ -413,8 +413,7 @@ static void cleanup_session(struct wd_aead_sess *sess)
 	sess->mm_ops.free(sess->mm_ops.usr, sess->ckey);
 	sess->mm_ops.free(sess->mm_ops.usr, sess->akey);
 
-	if (sess)
-		free(sess);
+	free(sess);
 }
 
 static int wd_aead_sess_eops_init(struct wd_aead_sess *sess)
