@@ -553,8 +553,8 @@ int wd_cipher_init2_(char *alg, __u32 sched_type, int task_type, struct wd_ctx_p
 	WD_INFO("ctxs numbers: %u.\n", wd_cipher_setting.config.ctx_num);
 	/* ═══ Phase 2.5: RR bind drivers ═══ */
 	ret = wd_ctx_bind_drivers(&wd_cipher_setting.config,
-				  wd_cipher_init_attrs.drv_array,
-				  wd_cipher_init_attrs.drv_count);
+				  wd_cipher_init_attrs.ctx_config_internal->drv_array,
+				  wd_cipher_init_attrs.ctx_config_internal->drv_count);
 	if (ret) {
 		WD_ERR("driver binding failed!\n");
 		goto out_common_uninit;

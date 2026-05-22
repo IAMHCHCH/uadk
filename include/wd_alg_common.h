@@ -209,8 +209,6 @@ struct wd_init_attrs {
 	wd_alg_poll_ctx alg_poll_ctx;
 
 	struct wd_ctx_config_internal *ctx_config_internal;
-	struct wd_alg_driver **drv_array;
-	__u32 drv_count; 
 };
 
 #ifdef __cplusplus

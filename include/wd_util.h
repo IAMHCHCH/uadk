@@ -486,8 +486,8 @@ static inline void wd_ctx_spin_unlock(struct wd_ctx_internal *ctx, int type)
 
 int wd_mem_ops_init(handle_t h_ctx, struct wd_mm_ops *mm_ops, int mem_type);
 
-int  wd_alg_drv_discover(struct wd_init_attrs *attrs);
-void wd_alg_drv_undiscover(struct wd_init_attrs *attrs);
+int  wd_ctx_config_init(struct wd_init_attrs *attrs);
+void wd_ctx_config_uninit(struct wd_init_attrs *attrs);
 int  wd_alg_ctx_init(struct wd_init_attrs *attrs);
 void wd_alg_ctx_uninit(struct wd_init_attrs *attrs);
 int  wd_ctx_bind_drivers(struct wd_ctx_config_internal *config,
