@@ -306,6 +306,9 @@ int wd_init_sched(struct wd_sched *in, struct wd_sched *from)
 
 	in->h_sched_ctx = from->h_sched_ctx;
 	in->name = strdup(from->name);
+	if (!in->name)
+		return -WD_ENOMEM;
+
 	in->sched_init = from->sched_init;
 	in->pick_next_ctx = from->pick_next_ctx;
 	in->poll_policy = from->poll_policy;
