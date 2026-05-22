@@ -28,6 +28,7 @@
 #include <sys/eventfd.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <time.h>
 #include "v1/wd_util.h"
 #include "v1/wd_comp.h"
 #include "v1/wd_cipher.h"
@@ -132,21 +133,27 @@ struct zip_fill_sqe_ops {
 	void (*fill_sqe_hw_info)(void *ssqe, struct wcrypto_comp_msg *msg);
 };
 
-static unsigned int g_err_print_enable = 1;
+static timer_t g_timerid;
+static sig_atomic_t g_err_print_enable = 1;
 
-static void zip_err_print_alarm_end(int sig)
+static void zip_err_print_alarm_end(union sigval sv)
 {
-	if (sig == SIGALRM) {
-		g_err_print_enable = 1;
-		alarm(0);
-	}
+	timer_delete(g_timerid);
+	g_err_print_enable = 1;
 }
 
 static void zip_err_print_time_start(void)
 {
-	g_err_print_enable = 0;
-	signal(SIGALRM, zip_err_print_alarm_end);
-	alarm(PRINT_TIME_INTERVAL);
+	struct itimerspec its = {0};
+	struct sigevent sev = {0};
+
+	sev.sigev_notify = SIGEV_THREAD;
+	sev.sigev_notify_function = zip_err_print_alarm_end;
+	sev.sigev_value.sival_ptr = &g_timerid;
+	timer_create(CLOCK_REALTIME, &sev, &g_timerid);
+
+	its.it_value.tv_sec = PRINT_TIME_INTERVAL;
+	timer_settime(g_timerid, 0, &its, NULL);
 }
 
 static void zip_err_bd_print(__u16 ctx_st, __u32 status, __u32 type)
@@ -155,6 +162,7 @@ static void zip_err_bd_print(__u16 ctx_st, __u32 status, __u32 type)
 		WD_ERR("bad status(ctx_st=0x%x, s=0x%x, t=%u)\n",
 			ctx_st, status, type);
 	} else if (g_err_print_enable == 1) {
+		g_err_print_enable = 0;
 		WD_ERR("bad status(ctx_st=0x%x, s=0x%x, t=%u)\n",
 			ctx_st, status, type);
 		zip_err_print_time_start();
