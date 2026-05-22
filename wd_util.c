@@ -1690,13 +1690,13 @@ static int wd_env_set_ctx_nums(const char *alg_name, const char *name, const cha
 
 	ret = wd_get_alg_type(alg_name, alg_type);
 	if (ret)
-		return ret;
+		goto free_start;
 
 	list = wd_get_accel_list(alg_type);
 	if (!list) {
 		WD_ERR("failed to get devices!\n");
-		free(start);
-		return -WD_ENODEV;
+		ret = -WD_ENODEV;
+		goto free_start;
 	}
 
 	left = start;
@@ -1707,6 +1707,7 @@ static int wd_env_set_ctx_nums(const char *alg_name, const char *name, const cha
 	}
 
 	wd_free_list_accels(list);
+free_start:
 	free(start);
 	return ret;
 }
