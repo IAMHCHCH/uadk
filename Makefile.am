@@ -120,7 +120,7 @@ if WD_STATIC_DRV
 AM_CFLAGS += -DWD_STATIC_DRV -fPIC
 AM_CFLAGS += -DWD_NO_LOG
 
-libwd_la_LIBADD = $(libwd_la_OBJECTS) -ldl -lnuma -lpthread
+libwd_la_LIBADD = $(libwd_la_OBJECTS) -ldl -lnuma -lpthread -lrt
 
 libwd_comp_la_LIBADD = $(libwd_la_OBJECTS) -ldl -lnuma -lpthread
 libwd_comp_la_DEPENDENCIES = libwd.la
