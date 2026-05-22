@@ -156,7 +156,7 @@ void wd_free_id(__u8 *buf, __u32 size, __u32 id, __u32 id_max)
 int wd_init_cookie_pool(struct wd_cookie_pool *pool,
 			__u32 cookies_size, __u32 cookies_num)
 {
-	__u64 total_size = cookies_size * cookies_num;
+	__u64 total_size = (__u64)cookies_size * cookies_num;
 
 	pool->cookies = calloc(1, total_size + cookies_num);
 	if (!pool->cookies)
