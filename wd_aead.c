@@ -580,8 +580,9 @@ static void wd_aead_clear_status(void)
 	wd_alg_clear_init(&wd_aead_setting.status);
 }
 
-static int wd_aead_init_nolock(struct wd_ctx_config *config, struct wd_sched *sched)
+static int wd_aead_init_nolock(struct wd_ctx_config *config, struct wd_sched *sched, void *attrs)
 {
+	(void)attrs;
 	int ret;
 
 	ret = wd_set_epoll_en("WD_AEAD_EPOLL_EN",
@@ -641,7 +642,7 @@ int wd_aead_init(struct wd_ctx_config *config, struct wd_sched *sched)
 	if (ret)
 		goto out_clear_init;
 
-	ret = wd_aead_init_nolock(config, sched);
+	ret = wd_aead_init_nolock(config, sched, NULL);
 	if (ret)
 		goto out_close_driver;
 

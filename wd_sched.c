@@ -109,6 +109,7 @@ struct wd_sched_domain_idx_cache {
 	/* === Per-ctx property tracking (LOOP/INSTR) === */
 	__u8 ctx_props[SKEY_CTX_MAX_NUM];           /* Prop value per idx_list entry */
 	atomic_uint prop_ptrs[4];                   /* Per-prop RR pointers (UADK_CTX_MAX) */
+	atomic_uint pick_counts[4];                 /* Per-prop pick statistics for debug */
 
 	/* === Synchronization === */
 	pthread_mutex_t cache_lock;		    /* Lock for structure modifications */
@@ -629,10 +630,18 @@ static int wd_sched_skey_cache_init(struct wd_sched_domain_idx_cache *cache, __u
 	cache->policy = policy;
 
 	/* Initialize per-ctx property tracking for LOOP/INSTR modes */
-	if (policy == SCHED_POLICY_LOOP || policy == SCHED_POLICY_INSTR) {
+	if (policy == SCHED_POLICY_LOOP || policy == SCHED_POLICY_HUNGRY ||
+		    policy == SCHED_POLICY_INSTR) {
 		memset(cache->ctx_props, 0, sizeof(cache->ctx_props));
 		for (i = 0; i < 4; i++)
 			atomic_store(&cache->prop_ptrs[i], 0);
+	}
+
+	/* Initialize pick statistics for verifiable policies */
+	if (policy == SCHED_POLICY_LOOP || policy == SCHED_POLICY_INSTR ||
+	    policy == SCHED_POLICY_HUNGRY) {
+		for (i = 0; i < 4; i++)
+			atomic_store(&cache->pick_counts[i], 0);
 	}
 
 	/* Initialize structure lock */
@@ -649,10 +658,25 @@ static int wd_sched_skey_cache_init(struct wd_sched_domain_idx_cache *cache, __u
  * 
  * Release resources and reset cache state.
  */
+
 static void wd_sched_skey_cache_uninit(struct wd_sched_domain_idx_cache *cache)
 {
+	__u32 hw, ce, sve, soft;
+
 	if (!cache)
 		return;
+
+	/* Dump pick statistics for verification before cleanup */
+	if (cache->policy == SCHED_POLICY_LOOP || cache->policy == SCHED_POLICY_INSTR ||
+	    cache->policy == SCHED_POLICY_HUNGRY) {
+		hw   = atomic_load(&cache->pick_counts[UADK_CTX_HW]);
+		ce   = atomic_load(&cache->pick_counts[UADK_CTX_CE_INS]);
+		sve  = atomic_load(&cache->pick_counts[UADK_CTX_SVE_INS]);
+		soft = atomic_load(&cache->pick_counts[UADK_CTX_SOFT]);
+		if (hw + ce + sve + soft > 0)
+			WD_INFO("SCHED_UNINIT_STATS: policy=%d valid=%u HW=%u CE=%u SVE=%u SOFT=%u (total=%u)\n",
+			        cache->policy, cache->valid_count, hw, ce, sve, soft, hw + ce + sve + soft);
+	}
 
 	pthread_mutex_destroy(&cache->cache_lock);
 
@@ -704,7 +728,8 @@ static int wd_sched_skey_add_ctx(struct wd_sched_domain_idx_cache *cache, __u32 
 	/* Add to next available position */
 	cache->idx_list[cache->valid_count] = ctx_id;
 	atomic_store(&cache->load_values[cache->valid_count], 0);
-	if (cache->policy == SCHED_POLICY_LOOP || cache->policy == SCHED_POLICY_INSTR)
+	if (cache->policy == SCHED_POLICY_LOOP || cache->policy == SCHED_POLICY_HUNGRY ||\
+		    cache->policy == SCHED_POLICY_INSTR)
 		cache->ctx_props[cache->valid_count] = prop;
 	cache->valid_count++;
 	pthread_mutex_unlock(&cache->cache_lock);
@@ -855,6 +880,9 @@ static __u32 wd_sched_skey_pick_next(struct wd_sched_domain_idx_cache *cache, __
 		return INVALID_POS;
 
 	*ctx_idx = selected_idx;
+	/* Track per-prop pick statistics for debug verification */
+	if (cache->ctx_props[selected_idx] < UADK_CTX_MAX)
+		atomic_fetch_add(&cache->pick_counts[cache->ctx_props[selected_idx]], 1);
 	return cache->idx_list[selected_idx];
 }
 
@@ -1007,7 +1035,6 @@ static int wd_sched_poll_skey(struct wd_sched_ctx *sched_ctx, struct wd_sched_ke
 			 __u32 expect, __u32 *count)
 {
 	__u32 sum_poll_num = 0;
-	__u32 current_load;
 	__u32 poll_num;
 	__u32 idx, i;
 	int ret;
@@ -1038,19 +1065,6 @@ static int wd_sched_poll_skey(struct wd_sched_ctx *sched_ctx, struct wd_sched_ke
  * ============================================================================
  */
 
-#define nop() asm volatile("nop")
-static void delay_us(int ustime)
-{
-	int cycle = 2600;
-	int i, j;
-
-	for (i = 0; i < ustime; i++) {
-		for (j = 0; j < cycle; j++)
-			nop();
-	}
-	usleep(1);
-}
-
 static void sched_skey_param_init(struct wd_sched_ctx *sched_ctx, struct wd_sched_key *skey)
 {
 	__u32 i;
@@ -1074,7 +1088,6 @@ static handle_t sched_session_common_init(struct wd_sched_ctx *sched_ctx,
 {
 	struct wd_sched_key *skey;
 	unsigned int node;
-	int ret = 0;
 
 	if (getcpu(NULL, &node)) {
 		WD_ERR("failed to get node, errno %d!\n", errno);
@@ -1108,10 +1121,6 @@ static handle_t sched_session_common_init(struct wd_sched_ctx *sched_ctx,
 	}
 
 	return (handle_t)skey;
-
-out:
-	free(skey);
-	return (handle_t)(-WD_EINVAL);	
 }
 
 static struct wd_sched_key *sched_get_poll_skey(struct wd_sched_ctx *sched_ctx)
@@ -1205,17 +1214,6 @@ static __u32 session_sched_init_ctx(struct wd_sched_ctx *sched_ctx,
  *
  * Releases all resources associated with session domains.
  */
-static void session_sched_domain_destroy(struct wd_sched_key *skey)
-{
-	if (!skey)
-		return;
-
-	/* Destroy both sync and async domains */
-	wd_sched_skey_domain_destroy(&skey->sync_domain);
-	wd_sched_skey_domain_destroy(&skey->async_domain);
-
-	WD_DEBUG("Destroyed session domains for skey\n");
-}
 
 /**
  * session_sched_domain_init - Initialize session domains with sync/async contexts
@@ -1326,7 +1324,6 @@ static __u32 round_robin_pick_next_ctx(handle_t h_sched_ctx, void *sched_key,
 	struct wd_sched_key *skey = (struct wd_sched_key *)sched_key;
 	struct wd_sched_key_domain *domain;
 	__u32 min_ctx, ctx_idx;
-	__u32 new_ctx;
 
 	if (unlikely(!h_sched_ctx || !skey)) {
 		WD_ERR("invalid: sched ctx or key is NULL!\n");
@@ -1689,8 +1686,9 @@ static __u32 loop_sched_pick_next_ctx(handle_t h_sched_ctx, void *sched_key,
 		pos = atomic_fetch_add(&cache->rr_ptr, 1) % cache->valid_count;
 		ctx_id = cache->idx_list[pos];
 		if (ctx_id != INVALID_POS) {
-			/* Update per-prop RR counter for tracking */
+			/* Update per-prop RR counter and pick stats for tracking */
 			atomic_fetch_add(&cache->prop_ptrs[cache->ctx_props[pos]], 1);
+			atomic_fetch_add(&cache->pick_counts[cache->ctx_props[pos]], 1);
 			return ctx_id;
 		}
 	} while (++retries < (int)cache->valid_count);
@@ -1770,8 +1768,10 @@ static __u32 instr_sched_pick_next_ctx(handle_t h_sched_ctx, void *sched_key,
 	for (i = 0; i < cache->valid_count; i++)
 		if (cache->ctx_props[i] == UADK_CTX_CE_INS ||
 		    cache->ctx_props[i] == UADK_CTX_SVE_INS)
-			if (count++ == rr_pos)
+			if (count++ == rr_pos) {
+				atomic_fetch_add(&cache->pick_counts[cache->ctx_props[i]], 1);
 				return cache->idx_list[i];
+			}
 
 	return INVALID_POS;
 }

@@ -169,7 +169,7 @@ int wd_hw_alloc_ctx(char *alg_name, void *params, handle_t *ctx)
 		}
 
 		/* Request hardware context from current device */
-		ctx_h = wd_request_ctx(dev);
+		ctx_h = (struct wd_ctx_h *)wd_request_ctx(dev);
 		if (ctx_h) {
 			/* Success: return context handle */
 			ctx_h->priv = NULL;

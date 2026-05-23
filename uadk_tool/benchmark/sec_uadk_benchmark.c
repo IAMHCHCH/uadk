@@ -724,10 +724,7 @@ static int init_ctx_config2(struct acc_option *options)
 	/* init */
 	switch(subtype) {
 	case CIPHER_TYPE:
-		if (options->mem_type == UADK_AUTO)
-			ret = wd_cipher_init2_(alg_name, SCHED_POLICY_HUNGRY, TASK_HW, &ctx_params);
-		else
-			ret = wd_cipher_init2_(alg_name, SCHED_POLICY_DEV, TASK_HW, &ctx_params);
+		ret = wd_cipher_init2_(alg_name, options->sched_type, options->task_type, &ctx_params);
 		if (ret)
 			SEC_TST_PRT("failed to do cipher init2!\n");
 		break;

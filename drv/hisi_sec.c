@@ -1187,7 +1187,7 @@ map_err:
 static void parse_cipher_bd2(struct hisi_qp *qp, struct hisi_sec_sqe *sqe,
 			     struct wd_cipher_msg *recv_msg)
 {
-	struct wd_cipher_msg *temp_msg;
+	struct wd_cipher_msg *temp_msg = NULL;
 	__u16 done;
 	__u32 tag;
 
@@ -1760,7 +1760,7 @@ static int hisi_sec_cipher_send_v3(handle_t ctx, void *wd_msg)
 static void parse_cipher_bd3(struct hisi_qp *qp, struct hisi_sec_sqe3 *sqe,
 			     struct wd_cipher_msg *recv_msg)
 {
-	struct wd_cipher_msg *temp_msg;
+	struct wd_cipher_msg *temp_msg = NULL;
 	__u16 done;
 	__u32 tag;
 
@@ -2009,7 +2009,7 @@ map_err:
 static void parse_digest_bd2(struct hisi_qp *qp, struct hisi_sec_sqe *sqe,
 			     struct wd_digest_msg *recv_msg)
 {
-	struct wd_digest_msg *temp_msg;
+	struct wd_digest_msg *temp_msg = NULL;
 	__u16 done;
 
 	done = sqe->type2.done_flag & SEC_DONE_MASK;
@@ -2558,7 +2558,7 @@ put_sgl:
 static void parse_digest_bd3(struct hisi_qp *qp, struct hisi_sec_sqe3 *sqe,
 				struct wd_digest_msg *recv_msg)
 {
-	struct wd_digest_msg *temp_msg;
+	struct wd_digest_msg *temp_msg = NULL;
 	__u16 done;
 
 	done = sqe->done_flag & SEC_DONE_MASK;
@@ -3315,7 +3315,7 @@ static void update_stream_counter(struct wd_aead_msg *recv_msg)
 static void parse_aead_bd2(struct hisi_qp *qp, struct hisi_sec_sqe *sqe,
 	struct wd_aead_msg *recv_msg)
 {
-	struct wd_aead_msg *temp_msg;
+	struct wd_aead_msg *temp_msg = NULL;
 	__u16 done, icv;
 
 	done = sqe->type2.done_flag & SEC_DONE_MASK;
@@ -3832,7 +3832,7 @@ put_sgl:
 static void parse_aead_bd3(struct hisi_qp *qp, struct hisi_sec_sqe3 *sqe,
 	struct wd_aead_msg *recv_msg)
 {
-	struct wd_aead_msg *temp_msg;
+	struct wd_aead_msg *temp_msg = NULL;
 	__u16 done, icv;
 
 	done = sqe->done_flag & SEC_DONE_MASK;
