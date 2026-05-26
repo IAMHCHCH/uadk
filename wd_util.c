@@ -2351,7 +2351,7 @@ static int wd_alloc_ctxs_by_mode(struct wd_ctx_config_internal *internal_config,
 	struct wd_ctx_params *ctx_params = attrs->ctx_params;
 	struct wd_alg_driver **drv_array = attrs->drv_array;
 	__u32 drv_count = attrs->drv_count;
-	const char *alg = attrs->alg;
+	char *alg = attrs->alg;
 	struct wd_drv_ctx_params dparams;
 	struct wd_alg_driver *drv;
 	handle_t ctx;
@@ -2408,9 +2408,6 @@ static int wd_alloc_ctxs_batch(struct wd_ctx_config_internal *internal_config,
 				struct wd_init_attrs *attrs)
 {
 	struct wd_ctx_params *ctx_params = attrs->ctx_params;
-	struct wd_alg_driver **drv_array = attrs->drv_array;
-	__u32 drv_count = attrs->drv_count;
-	const char *alg = attrs->alg;
 	__u32 sync_num = 0, async_num = 0;
 	__u32 ctx_idx = 0;
 	__u32 sync_allocated, async_allocated;
