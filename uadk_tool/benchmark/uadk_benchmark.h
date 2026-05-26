@@ -82,6 +82,7 @@ struct acc_option {
 	bool latency;
 	u32 sched_type;
 	int task_type;
+	bool sched_override;
 	int mem_type;
 	u32 data_fmt;
 };

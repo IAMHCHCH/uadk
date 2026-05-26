@@ -617,8 +617,10 @@ int acc_benchmark_run(struct acc_option *option)
 	int i, ret = 0;
 	int status;
 
-	option->sched_type = SCHED_POLICY_HUNGRY;
-	option->task_type = TASK_HW;
+	if (!option->sched_override) {
+		option->sched_type = SCHED_POLICY_HUNGRY;
+		option->task_type = TASK_HW;
+	}
 	parse_alg_param(option);
 	dump_param(option);
 	g_run_options = option;
@@ -866,6 +868,7 @@ int acc_cmd_parse(int argc, char *argv[], struct acc_option *option)
 				ACC_TST_PRT("invalid: unknown policy '%s', use rr/loop/hungry/instr\n", optarg);
 				goto to_exit;
 			}
+			option->sched_override = true;
 			break;
 		default:
 			ACC_TST_PRT("invalid: bad input parameter!\n");
