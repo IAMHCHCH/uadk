@@ -40,8 +40,8 @@ pkginclude_HEADERS = include/wd.h include/wd_internal.h include/wd_cipher.h incl
 		  include/wd_udma.h include/wd_join_gather.h \
 		  include/wd_bmm.h
 
-nobase_pkginclude_HEADERS = v1/wd.h v1/wd_cipher.h v1/wd_aead.h v1/uacce.h v1/wd_dh.h \
-			 v1/wd_digest.h v1/wd_rsa.h v1/wd_bmm.h
+nobase_pkginclude_HEADERS=v1/wd.h v1/wd_cipher.h v1/wd_aead.h v1/wd_dh.h v1/wd_digest.h \
+			  v1/wd_rsa.h v1/wd_bmm.h v1/wd_ecc.h v1/wd_comp.h
 
 lib_LTLIBRARIES=libwd.la libwd_comp.la libwd_crypto.la libwd_dae.la libwd_udma.la
 
@@ -120,20 +120,20 @@ if WD_STATIC_DRV
 AM_CFLAGS += -DWD_STATIC_DRV -fPIC
 AM_CFLAGS += -DWD_NO_LOG
 
-libwd_la_LIBADD = $(libwd_la_OBJECTS) -ldl -lnuma
+libwd_la_LIBADD = $(libwd_la_OBJECTS) -ldl -lnuma -lpthread -lrt
 
-libwd_comp_la_LIBADD = $(libwd_la_OBJECTS) -ldl -lnuma
+libwd_comp_la_LIBADD = $(libwd_la_OBJECTS) -ldl -lnuma -lpthread
 libwd_comp_la_DEPENDENCIES = libwd.la
 
-libhisi_zip_la_LIBADD = -ldl
+libhisi_zip_la_LIBADD = -ldl -lpthread
 
-libwd_crypto_la_LIBADD = -lwd -ldl -lnuma -lm -lpthread
+libwd_crypto_la_LIBADD = -lwd -ldl -lnuma -lpthread
 libwd_crypto_la_DEPENDENCIES = libwd.la
 
 libwd_udma_la_LIBADD = $(libwd_la_OBJECTS) -ldl -lnuma -lm -lpthread
 libwd_udma_la_DEPENDENCIES = libwd.la
 
-libwd_dae_la_LIBADD = $(libwd_la_OBJECTS) -ldl -lnuma
+libwd_dae_la_LIBADD = $(libwd_la_OBJECTS) -ldl -lnuma -lm -lpthread
 libwd_dae_la_DEPENDENCIES = libwd.la
 
 libhisi_sec_la_LIBADD = $(libwd_la_OBJECTS) $(libwd_crypto_la_OBJECTS)
@@ -164,19 +164,19 @@ UADK_V1_SYMBOL= -Wl,--version-script,$(top_srcdir)/v1/libwd.map
 libwd_la_LDFLAGS=$(UADK_VERSION) $(UADK_WD_SYMBOL) $(UADK_V1_SYMBOL)
 libwd_la_LIBADD= -ldl -lnuma
 
-libwd_comp_la_LIBADD= -lwd -ldl -lnuma
-libwd_comp_la_LDFLAGS=$(UADK_VERSION) $(UADK_COMP_SYMBOL) -lpthread
+libwd_comp_la_LIBADD= -lwd -ldl -lnuma -lpthread
+libwd_comp_la_LDFLAGS=$(UADK_VERSION) $(UADK_COMP_SYMBOL)
 libwd_comp_la_DEPENDENCIES= libwd.la
 
-libwd_crypto_la_LIBADD= -lwd -ldl -lnuma
-libwd_crypto_la_LDFLAGS=$(UADK_VERSION) $(UADK_CRYPTO_SYMBOL) -lpthread
+libwd_crypto_la_LIBADD= -lwd -ldl -lnuma -lpthread
+libwd_crypto_la_LDFLAGS=$(UADK_VERSION) $(UADK_CRYPTO_SYMBOL)
 libwd_crypto_la_DEPENDENCIES= libwd.la
 
 libwd_udma_la_LIBADD= -lwd -ldl -lnuma -lm -lpthread
 libwd_udma_la_LDFLAGS=$(UADK_VERSION) $(UADK_DAE_SYMBOL)
 libwd_udma_la_DEPENDENCIES= libwd.la
 
-libwd_dae_la_LIBADD= -lwd -ldl -lnuma -lm
+libwd_dae_la_LIBADD= -lwd -ldl -lnuma -lm -lpthread
 libwd_dae_la_LDFLAGS=$(UADK_VERSION) $(UADK_DAE_SYMBOL)
 libwd_dae_la_DEPENDENCIES= libwd.la
 

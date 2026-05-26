@@ -805,9 +805,6 @@ int wd_do_cipher_async(handle_t h_sess, struct wd_cipher_req *req)
 	}
 
 	wd_dfx_msg_cnt(config, WD_CTX_CNT_NUM, idx);
-	ret = wd_add_task_to_async_queue(&wd_cipher_env_config, idx);
-	if (ret)
-		goto fail_with_msg;
 
 	return 0;
 
@@ -888,15 +885,10 @@ int wd_cipher_poll(__u32 expt, __u32 *count)
 	return sched->poll_policy(h_ctx, expt, count);
 }
 
-static const struct wd_config_variable table[] = {
-	{ .name = "WD_CIPHER_CTX_NUM",
-	  .def_val = "sync:2@0,async:2@0",
-	  .parse_fn = wd_parse_ctx_num
-	},
-	{ .name = "WD_CIPHER_ASYNC_POLL_EN",
-	  .def_val = "0",
-	  .parse_fn = wd_parse_async_poll_en
-	}
+static const struct wd_config_variable table = {
+	.name = "WD_CIPHER_CTX_NUM",
+	.def_val = "sync:2@0,async:2@0",
+	.parse_fn = wd_parse_ctx_num
 };
 
 static const struct wd_alg_ops wd_cipher_ops = {
@@ -911,8 +903,8 @@ int wd_cipher_env_init(struct wd_sched *sched)
 {
 	wd_cipher_env_config.sched = sched;
 
-	return wd_alg_env_init(&wd_cipher_env_config, table,
-				&wd_cipher_ops, ARRAY_SIZE(table), NULL);
+	return wd_alg_env_init(&wd_cipher_env_config, &table,
+				&wd_cipher_ops, 1, NULL);
 }
 
 void wd_cipher_env_uninit(void)
@@ -929,8 +921,8 @@ int wd_cipher_ctx_num_init(__u32 node, __u32 type, __u32 num, __u8 mode)
 	if (ret)
 		return ret;
 
-	return wd_alg_env_init(&wd_cipher_env_config, table,
-			       &wd_cipher_ops, ARRAY_SIZE(table), &ctx_attr);
+	return wd_alg_env_init(&wd_cipher_env_config, &table,
+			       &wd_cipher_ops, 1, &ctx_attr);
 }
 
 void wd_cipher_ctx_num_uninit(void)
