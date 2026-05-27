@@ -33,6 +33,7 @@
 #define SKEY_CTX_MAX_NUM		16
 #define SKEY_MAX_THREAD_NUM		64
 #define SKEY_LOAD_UPDATE_INTERVAL 128
+#define HW_CTX_FULL_DEPTH		1023
 
 #define MAX_NUMA_NODES		(NUMA_NUM_NODES >> 5)
 
@@ -1576,10 +1577,13 @@ static __u32 skey_sched_pick_next_ctx(handle_t h_sched_ctx, void *sched_key,
 	if (min_ctx == INVALID_POS)
 		return INVALID_POS;
 
+	/* If the queue with the lightest load is already fully loaded, then tasks cannot be dispatched. */
+	min_load = domain->idx_cache.load_values[ctx_idx];
+	if (min_load >= HW_CTX_FULL_DEPTH)
+		return INVALID_POS;
+
 	/* Update load value for send one task */
 	wd_sched_skey_update_load(&domain->idx_cache, ctx_idx, 1);
-	min_load = domain->idx_cache.load_values[ctx_idx];
-
 	/* Check if we need to expand context pool */
 	if (min_load > HUNGRY_LOAD_THRESHOLD) {
 		/* Try to allocate new context from domain */

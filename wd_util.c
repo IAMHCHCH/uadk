@@ -1405,6 +1405,9 @@ int wd_check_ctx(struct wd_ctx_config_internal *config, __u8 mode, __u32 idx)
 {
 	struct wd_ctx_internal *ctx;
 
+	if (unlikely(idx == INVALID_POS))
+		return -WD_EBUSY;
+
 	if (unlikely(idx >= config->ctx_num)) {
 		WD_ERR("failed to pick a proper ctx: idx %u!\n", idx);
 		return -WD_EINVAL;
