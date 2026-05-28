@@ -135,7 +135,8 @@ void wd_comp_uninit(void);
  *
  * Return 0 if succeed and others if fail.
  */
-int wd_comp_init2_(char *alg, __u32 sched_type, int task_type, struct wd_ctx_params *ctx_params);
+int wd_comp_init2_(const char *alg, __u32 sched_type, int task_type,
+		   struct wd_ctx_params *ctx_params);
 
 #define wd_comp_init2(alg, sched_type, task_type) \
 	wd_comp_init2_(alg, sched_type, task_type, NULL)
@@ -251,7 +252,8 @@ void wd_comp_ctx_num_uninit(void);
  * @type:	operation type.
  * @mode:	0: sync mode, 1: async mode
  * @num:	return ctx num.
- * @is_enable	return enable inner poll flag.
+ * @is_enable:  return enable inner poll flag, inner poll is not
+ *             supported, and is_enable will always be 0.
  *
  * If the current algorithm library does not require the type parameter,
  * the type parameter is invalid. The function returns 0 to indicate that

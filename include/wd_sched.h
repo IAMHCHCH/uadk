@@ -25,6 +25,12 @@ enum sched_policy_type {
 	SCHED_POLICY_SINGLE,
 	/* requests will be sent to ctxs and dev_id */
 	SCHED_POLICY_DEV,
+	/* loop scheduling across all ctx properties */
+	SCHED_POLICY_LOOP,
+	/* hungry load-based scheduling with dynamic expansion */
+	SCHED_POLICY_HUNGRY,
+	/* instruction-set based scheduling */
+	SCHED_POLICY_INSTR,
 	SCHED_POLICY_BUTT,
 };
 
@@ -35,6 +41,7 @@ struct sched_params {
 	__u32 begin;
 	__u32 end;
 	__u32 dev_id;
+	int ctx_prop;
 };
 
 typedef int (*user_poll_func)(__u32 pos, __u32 expect, __u32 *count);

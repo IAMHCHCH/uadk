@@ -82,6 +82,7 @@ struct acc_option {
 	bool latency;
 	u32 sched_type;
 	int task_type;
+	bool sched_override;
 	int mem_type;
 	u32 data_fmt;
 };
@@ -117,6 +118,7 @@ enum alg_type {
 	X25519_TYPE,
 	X448_TYPE,
 	CIPHER_INSTR_TYPE,
+	DIGEST_INSTR_TYPE,
 };
 
 enum sync_type {

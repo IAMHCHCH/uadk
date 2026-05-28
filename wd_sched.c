@@ -1,191 +1,1174 @@
 // SPDX-License-Identifier: Apache-2.0
 /*
- * Copyright 2020-2021 Huawei Technologies Co.,Ltd. All rights reserved.
+ * Copyright 2020-2026 Huawei Technologies Co.,Ltd. All rights reserved.
  * Copyright 2020-2021 Linaro ltd.
+ *
+ * Scheduler: Simplified Pure Hash Table with Dynamic Context Expansion
+ *
+ * Key improvements:
+ * - Single global hash table with (region_id, mode, op_type, prop) dimensions
+ * - Segment list for non-contiguous ctx ranges
+ * - Dual-domain queues for session key.
+ * - Dynamic ctx expansion in HUNGRY mode based on load threshold
+ * - Packet reception is handled through the active queues in the session key.
+ * - Simplified sched_init: only allocate one sync + one async ctx
+ * - Removed redundant wd_sched_info layer
  */
 
 #define _GNU_SOURCE
 #include <stdlib.h>
 #include <stdbool.h>
+#include <string.h>
 #include <sched.h>
 #include <numa.h>
+#include <limits.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include "wd_sched.h"
+#include "wd_alg.h"
+#include "wd_internal.h"
 
-#define MAX_POLL_TIMES 1000
+#define MAX_POLL_TIMES			1000
+#define HUNGRY_LOAD_THRESHOLD		256
+#define SKEY_CTX_MAX_NUM		16
+#define SKEY_MAX_THREAD_NUM		64
+#define SKEY_LOAD_UPDATE_INTERVAL 128
+#define HW_CTX_FULL_DEPTH		1023
 
+#define MAX_NUMA_NODES		(NUMA_NUM_NODES >> 5)
+
+/* ============================================================================
+ * Hash Table Configuration
+ * ============================================================================
+ */
+#define WD_SCHED_MAX_BUCKETS		512
+#define WD_SCHED_MIN_BUCKETS		32
+#define WD_SCHED_LOAD_FACTOR		0.75f
+#define HASH_PRIME1			73
+#define HASH_PRIME2			13
+#define HASH_PRIME3			7
+#define HASH_PRIME4			11
+
+/* ============================================================================
+ * Scheduling Region Mode
+ * ============================================================================
+ */
 enum sched_region_mode {
 	SCHED_MODE_SYNC = 0,
 	SCHED_MODE_ASYNC = 1,
 	SCHED_MODE_BUTT
 };
 
-/*
- * sched_key - The key if schedule region.
- * @numa_id: The schedule numa region id.
- * @mode: Sync mode:0, async_mode:1
- * @type: Service type , the value must smaller than type_num.
- * @sync_ctxid: alloc ctx id for sync mode
- * @async_ctxid: alloc ctx id for async mode
+/* ============================================================================
+ * Segment List for Domain Index Organization
+ * ============================================================================
  */
-struct sched_key {
-	int numa_id;
-	__u8 type;
-	__u8 mode;
-	__u32 sync_ctxid;
-	__u32 async_ctxid;
-	__u32 dev_id;
-};
 
-/*
- * struct sched_ctx_range - define one ctx pos.
- * @begin: the start pos in ctxs of config.
- * @end: the end pos in ctxx of config.
- * @last: the last one which be distributed.
- * @valid: the region used flag.
- * @lock: lock the currentscheduling region.
+/**
+ * wd_sched_ctx_segment - Contiguous segment of ctx indices in domain
+ * @begin: Start index of this segment
+ * @end: End index of this segment (inclusive)
+ * @next: Pointer to next segment in the linked list
+ *
+ * Supports non-contiguous ctx ranges via segment list.
  */
-struct sched_ctx_region {
+struct wd_sched_ctx_segment {
 	__u32 begin;
 	__u32 end;
-	__u32 last;
+	struct wd_sched_ctx_segment *next;
+};
+
+/* ============================================================================
+ * Session key domain cache processing.
+ * ============================================================================
+ */
+
+/**
+ * wd_sched_domain_idx_cache - Simplified fixed array cache for skey domains
+ *
+ * Design principles:
+ * - Fixed array for cache-friendly memory layout
+ * - Atomic operations for lock-free load tracking
+ * - Simple RR and load balancing strategies
+ * - Maximum 16 queues per thread (typical usage)
+ */
+struct wd_sched_domain_idx_cache {
+	/* === Queue index array === */
+	__u32 idx_list[SKEY_CTX_MAX_NUM];	    /* Array of ctx indices */
+	atomic_uint load_values[SKEY_CTX_MAX_NUM];  /* Atomic load counters */
+	__u32 valid_count;			    /* Number of valid queues */
+
+	/* === Scheduling state === */
+	atomic_uint rr_ptr;			    /* Round-robin pointer */
+	atomic_uint min_load_idx;		    /* Cached min load index */
+	atomic_uint op_counter; 		    /* Operation counter for updates */
+
+	/* === Configuration === */
+	__u32 update_interval;			    /* Min load update interval */
+	__u8 policy;		    		    /* Scheduling policy */
+
+	/* === Per-ctx property tracking (LOOP/INSTR) === */
+	__u8 ctx_props[SKEY_CTX_MAX_NUM];           /* Prop value per idx_list entry */
+	atomic_uint prop_ptrs[4];                   /* Per-prop RR pointers (UADK_CTX_MAX) */
+	atomic_uint pick_counts[4];                 /* Per-prop pick statistics for debug */
+
+	/* === Synchronization === */
+	pthread_mutex_t cache_lock;		    /* Lock for structure modifications */
+};
+
+/**
+ * wd_sched_ctx_domain - Scheduling domain with four dimensions
+ * @region_id: Region identifier (numa_id or device_id)
+ * @mode: Context mode (SYNC/ASYNC)
+ * @op_type: Operation type
+ * @prop: Property (e.g., device type: HW, CE, SOFT)
+ * @segments: Linked list of context ranges
+ * @segment_count: Number of segments
+ * @total_ctx_count: Total contexts across all segments
+ * @current_segment: Current segment pointer for round-robin
+ * @current_pos: Current position within segment
+ * @valid: Domain validity flag
+ * @lock: Synchronization spinlock
+ */
+struct wd_sched_ctx_domain {
+	int region_id;
+	__u8 mode;
+	__u32 op_type;
+	__u8 prop;
+
+	struct wd_sched_ctx_segment *segments;
+	__u32 segment_count;
+	__u32 total_ctx_count;
+
+	struct wd_sched_ctx_segment *current_segment;
+	__u32 current_pos;
 	bool valid;
+
 	pthread_mutex_t lock;
 };
 
-/*
- * wd_sched_info - define the context of the scheduler.
- * @ctx_region: define the map for the comp ctxs, using for quickly search.
- *              the x range: two(sync and async), the y range:
- *              two(e.g. comp and uncomp) the map[x][y]'s value is the ctx
- *              begin and end pos.
- * @valid: the region used flag.
+/**
+ * wd_sched_domain_hash_node - Hash table collision chain node
  */
-struct wd_sched_info {
-	struct sched_ctx_region *ctx_region[SCHED_MODE_BUTT];
-	bool valid;
+struct wd_sched_domain_hash_node {
+	struct wd_sched_ctx_domain domain;
+	struct wd_sched_domain_hash_node *next;
 };
 
-struct dev_region_map {
-	__u32 dev_id;
-	__u32 region_id;
+/**
+ * wd_sched_domain_hash_table - Pure dynamic hash table for scheduling domains
+ * @buckets: Hash table bucket array
+ * @bucket_size: Number of buckets
+ * @entry_count: Total entries in table
+ * @max_chain_length: Maximum chain length for statistics
+ * @lock: Read-write lock for concurrent access
+ */
+struct wd_sched_domain_hash_table {
+	struct wd_sched_domain_hash_node **buckets;
+	__u32 bucket_size;
+	__u32 entry_count;
+	__u32 max_chain_length;
+
+	pthread_mutex_t lock;
 };
-/*
- * wd_sched_ctx - define the context of the scheduler.
- * @policy: define the policy of the scheduler.
- * @numa_num: the max numa numbers of the scheduler.
- * @type_num: the max operation types of the scheduler.
- * @poll_func: the task's poll operation function.
- * @numa_map: a map of cpus to devices.
- * @sched_info: the context of the scheduler.
+
+/* ============================================================================
+ * Dual-Domain Structure for Session Key
+ * ============================================================================
+ */
+
+/**
+ * wd_sched_key_domain - Session domain with min-heap
+ * @idx_cache: Index cache with min-heap for load-based selection
+ * @lock: Synchronization spinlock
+ * @expanded_count: Track how many times ctx has been expanded
+ */
+struct wd_sched_key_domain {
+	struct wd_sched_domain_idx_cache idx_cache;
+	pthread_mutex_t lock;
+	__u32 expanded_count;
+	atomic_int pending_count;	/* Pending request count for poll optimization */
+};
+
+/**
+ * wd_sched_key - Session-level scheduling key
+ * @region_id: Region identifier
+ * @type: Operation type
+ * @mode: Current mode (SYNC/ASYNC)
+ * @dev_id: Device identifier (for SCHED_POLICY_DEV)
+ * @ctx_prop: Context property
+ * @is_stream: Stream mode flag
+ * @prio_mode: Priority mode
+ * @pkt_size: Current packet size
+ * @sync_domain: Min-heap domain for sync contexts
+ * @async_domain: Min-heap domain for async contexts
+ * @lock: Synchronization spinlock
+ */
+struct wd_sched_key {
+	int region_id;
+	__u8 type;
+	__u8 mode;
+	__u32 dev_id;
+	__u8 ctx_prop;
+	__u16 is_stream;
+	__u16 prio_mode;
+	__u32 pkt_size;
+
+	struct wd_sched_key_domain sync_domain;
+	struct wd_sched_key_domain async_domain;
+
+	pthread_mutex_t lock;
+
+	/* Compat filtering parameters for session-ctx matching */
+	const char *alg_name;
+	struct wd_ctx_internal *ctxs;
+};
+
+/**
+ * wd_sched_ctx - Main scheduler context
+ * @policy: Scheduling policy type
+ * @type_num: Number of operation types
+ * @mode_num: Number of modes (SYNC/ASYNC)
+ * @region_num: Number of regions (numa or devices)
+ * @poll_func: Poll function for receiving responses
+ * @domain_hash_table: Global hash table for all domains
+ * @skey_num: Number of active session keys
+ * @skey_lock: Lock for skey array
+ * @skey: Array of session keys
+ * @poll_tid: Thread IDs for polling
  */
 struct wd_sched_ctx {
 	__u32 policy;
 	__u32 type_num;
-	__u16 numa_num;
-	__u16 dev_num;
+	__u32 mode_num;
+	__u16 region_num;
+
 	user_poll_func poll_func;
-	int numa_map[NUMA_NUM_NODES];
-	struct dev_region_map dev_id_map[DEVICE_REGION_MAX];
-	struct wd_sched_info sched_info[0];
+	struct wd_sched_domain_hash_table *domain_hash_table;
+
+	__u32 skey_num;
+	pthread_mutex_t skey_lock;
+	struct wd_sched_key *skey[SKEY_MAX_THREAD_NUM];
+	__u32 poll_tid[SKEY_MAX_THREAD_NUM];
 };
 
-static bool sched_key_valid(struct wd_sched_ctx *sched_ctx, const struct sched_key *key)
+/* ============================================================================
+ * Hash Table Core Operations
+ * ============================================================================
+ */
+
+static bool wd_sched_is_prime(__u32 n)
 {
-	if (key->numa_id >= sched_ctx->numa_num || key->mode >= SCHED_MODE_BUTT ||
-	    key->type >= sched_ctx->type_num) {
-		WD_ERR("invalid: sched key's numa: %d, mode: %u, type: %u!\n",
-		       key->numa_id, key->mode, key->type);
+	__u32 i;
+
+	if (n <= 1)
 		return false;
+	if (n <= 3)
+		return true;
+	if (n % 2 == 0 || n % 3 == 0)
+		return false;
+
+	for (i = 5; i * i <= n; i += 6) {
+		if (n % i == 0 || n % (i + 2) == 0)
+			return false;
 	}
 
 	return true;
 }
 
-/*
- * sched_get_ctx_range - Get ctx range from ctx_map by the wd comp arg
- */
-static struct sched_ctx_region *sched_get_ctx_range(struct wd_sched_ctx *sched_ctx,
-						    const struct sched_key *key)
+static __u32 wd_sched_find_prime(__u32 n)
 {
-	struct wd_sched_info *sched_info;
-	int numa_id;
+	while (!wd_sched_is_prime(n))
+		n++;
+	return n;
+}
 
-	sched_info = sched_ctx->sched_info;
-	if (key->numa_id >= 0 &&
-	    sched_info[key->numa_id].ctx_region[key->mode][key->type].valid)
-		return &sched_info[key->numa_id].ctx_region[key->mode][key->type];
+static __u32 wd_sched_compute_bucket_size(__u32 estimated_entries)
+{
+	__u32 target_size;
 
-	/* If the key->numa_id is not exist, we should scan for a region */
-	for (numa_id = 0; numa_id < sched_ctx->numa_num; numa_id++) {
-		if (sched_info[numa_id].ctx_region[key->mode][key->type].valid)
-			return &sched_info[numa_id].ctx_region[key->mode][key->type];
+	target_size = (estimated_entries * 4) / 3;
+
+	if (target_size < WD_SCHED_MIN_BUCKETS)
+		target_size = WD_SCHED_MIN_BUCKETS;
+	if (target_size > WD_SCHED_MAX_BUCKETS)
+		target_size = WD_SCHED_MAX_BUCKETS;
+
+	return wd_sched_find_prime(target_size);
+}
+
+/**
+ * wd_sched_hash_compute - Compute hash value for four-dimensional domain key
+ * @region_id: Region identifier
+ * @mode: Context mode
+ * @op_type: Operation type
+ * @prop: Property
+ * @bucket_size: Hash table bucket count
+ *
+ * Combines four dimensions using prime number multipliers.
+ */
+static inline __u32 wd_sched_hash_compute(int region_id, __u8 mode,
+                                          __u32 op_type, __u8 prop, __u32 bucket_size)
+{
+	__u32 hash;
+
+	hash = (region_id * HASH_PRIME1) + (mode * HASH_PRIME2) +
+	       (op_type * HASH_PRIME3) + (prop * HASH_PRIME4);
+	return hash % bucket_size;
+}
+
+static inline bool wd_sched_domain_key_match(
+	int region_id1, __u8 mode1, __u32 op_type1, __u8 prop1,
+	int region_id2, __u8 mode2, __u32 op_type2, __u8 prop2)
+{
+	return (region_id1 == region_id2 && mode1 == mode2 &&
+		op_type1 == op_type2 && prop1 == prop2);
+}
+
+/**
+ * wd_sched_hash_table_create - Create hash table
+ * @estimated_entries: Estimated number of entries
+ *
+ * Returns: Initialized hash table or NULL on error
+ */
+static struct wd_sched_domain_hash_table *
+wd_sched_hash_table_create(__u32 estimated_entries)
+{
+	struct wd_sched_domain_hash_table *table;
+	__u32 bucket_size;
+	int ret;
+
+	table = calloc(1, sizeof(*table));
+	if (!table)
+		return NULL;
+
+	bucket_size = wd_sched_compute_bucket_size(estimated_entries);
+	WD_DEBUG("Hash table: estimated_entries=%u, bucket_size=%u\n",
+		 estimated_entries, bucket_size);
+
+	table->buckets = calloc(bucket_size, sizeof(*table->buckets));
+	if (!table->buckets) {
+		free(table);
+		return NULL;
 	}
 
-	return NULL;
+	table->bucket_size = bucket_size;
+	table->entry_count = 0;
+	table->max_chain_length = 0;
+
+	ret = pthread_mutex_init(&table->lock, NULL);
+	if (ret) {
+		free(table->buckets);
+		free(table);
+		return NULL;
+	}
+
+	return table;
 }
 
-/*
- * sched_get_next_pos_rr - Get next resource pos by RR schedule.
- * The second para is reserved for future.
+static void wd_sched_hash_table_destroy(struct wd_sched_domain_hash_table *table)
+{
+	struct wd_sched_domain_hash_node *node, *next;
+	__u32 i;
+
+	if (!table)
+		return;
+
+	for (i = 0; i < table->bucket_size; i++) {
+		node = table->buckets[i];
+		while (node) {
+			next = node->next;
+
+			/* Release segment linked list */
+			struct wd_sched_ctx_segment *seg = node->domain.segments;
+			while (seg) {
+				struct wd_sched_ctx_segment *next_seg = seg->next;
+				free(seg);
+				seg = next_seg;
+			}
+
+			pthread_mutex_destroy(&node->domain.lock);
+			free(node);
+			node = next;
+		}
+	}
+
+	pthread_mutex_destroy(&table->lock);
+	free(table->buckets);
+	free(table);
+}
+
+static struct wd_sched_ctx_domain *
+wd_sched_hash_table_lookup(struct wd_sched_domain_hash_table *table,
+                           int region_id, __u8 mode, __u32 op_type, __u8 prop)
+{
+	struct wd_sched_domain_hash_node *node;
+	struct wd_sched_ctx_domain *domain = NULL;
+	__u32 hash_idx;
+	__u8 node_idx = 0;
+
+	if (!table)
+		return NULL;
+
+	hash_idx = wd_sched_hash_compute(region_id, mode, op_type, prop, table->bucket_size);
+
+	pthread_mutex_lock(&table->lock);
+	node = table->buckets[hash_idx];
+	while (node) {
+		if (wd_sched_domain_key_match(
+			node->domain.region_id, node->domain.mode, node->domain.op_type,
+			node->domain.prop,	region_id, mode, op_type, prop)) {
+			domain = &node->domain;
+			break;
+		}
+		node = node->next;
+		node_idx++;
+	}
+	pthread_mutex_unlock(&table->lock);
+	WD_DEBUG("Get domain hash_idx: %u ------node idx: %u.\n", hash_idx, node_idx);
+
+	return domain;
+}
+
+static struct wd_sched_ctx_domain *
+wd_sched_hash_table_insert(struct wd_sched_domain_hash_table *table,
+                           int region_id, __u8 mode, __u32 op_type, __u8 prop)
+{
+	struct wd_sched_domain_hash_node *new_node;
+	struct wd_sched_ctx_domain *existing;
+	__u32 chain_length = 0;
+	__u32 hash_idx;
+	int ret;
+
+	if (!table)
+		return NULL;
+
+	existing = wd_sched_hash_table_lookup(table, region_id, mode, op_type, prop);
+	if (existing)
+		return existing;
+
+	hash_idx = wd_sched_hash_compute(region_id, mode, op_type, prop, table->bucket_size);
+	WD_DEBUG("Instance domain hash_idx: %u\n", hash_idx);
+
+	pthread_mutex_lock(&table->lock);
+	/* Alloc and initialize new domain */
+	new_node = calloc(1, sizeof(*new_node));
+	if (!new_node) {
+		pthread_mutex_unlock(&table->lock);
+		return NULL;
+	}
+
+	/* Initialize new domain */
+	new_node->domain.region_id = region_id;
+	new_node->domain.mode = mode;
+	new_node->domain.op_type = op_type;
+	new_node->domain.prop = prop;
+	new_node->domain.segments = NULL;
+	new_node->domain.segment_count = 0;
+	new_node->domain.total_ctx_count = 0;
+	new_node->domain.current_segment = NULL;
+	new_node->domain.current_pos = 0;
+	new_node->domain.valid = false;
+
+	ret = pthread_mutex_init(&new_node->domain.lock, NULL);
+	if (ret) {
+		pthread_mutex_unlock(&table->lock);
+		free(new_node);
+		return NULL;
+	}
+
+	new_node->next = table->buckets[hash_idx];
+	table->buckets[hash_idx] = new_node;
+
+	table->entry_count++;
+	if (new_node->next) {
+		chain_length++;
+		if (chain_length > table->max_chain_length)
+			table->max_chain_length = chain_length;
+	}
+
+	pthread_mutex_unlock(&table->lock);
+
+	WD_DEBUG("Created new domain: region=%d, mode=%u, op_type=%u, prop=%u\n",
+		 region_id, mode, op_type, prop);
+
+	return &new_node->domain;
+}
+
+/* ============================================================================
+ * Segment List Operations
+ * ============================================================================
  */
-static __u32 sched_get_next_pos_rr(struct sched_ctx_region *region, void *para)
+
+/**
+ * wd_sched_domain_add_segment - Add context range segment to domain
+ * @domain: Target domain
+ * @begin: Start context index
+ * @end: End context index (inclusive)
+ *
+ * Supports non-contiguous context ranges via segment list.
+ */
+static int wd_sched_domain_add_segment(struct wd_sched_ctx_domain *domain,
+                                       __u32 begin, __u32 end)
+{
+	struct wd_sched_ctx_segment *seg, *new_seg;
+
+	if (!domain || begin > end)
+		return -WD_EINVAL;
+
+	new_seg = calloc(1, sizeof(*new_seg));
+	if (!new_seg)
+		return -WD_ENOMEM;
+
+	new_seg->begin = begin;
+	new_seg->end = end;
+	new_seg->next = NULL;
+
+	pthread_mutex_lock(&domain->lock);
+
+	/* Append to segment list tail */
+	if (!domain->segments) {
+		domain->segments = new_seg;
+	} else {
+		seg = domain->segments;
+		while (seg->next)
+			seg = seg->next;
+		seg->next = new_seg;
+	}
+
+	domain->segment_count++;
+	domain->total_ctx_count += (end - begin + 1);
+
+	/* Initialize polling state */
+	if (!domain->current_segment) {
+		domain->current_segment = domain->segments;
+		domain->current_pos = 0;
+	}
+
+	pthread_mutex_unlock(&domain->lock);
+
+	WD_DEBUG("Added segment to domain: begin=%u, end=%u, total_count=%u\n",
+		 begin, end, domain->total_ctx_count);
+
+	return 0;
+}
+
+/**
+ * wd_sched_domain_get_next_rr - Get next context via round-robin from domain
+ * @domain: Source domain
+ *
+ * Returns: Next global queue index in round-robin order (queue number, not relative index)
+ * Time complexity: O(1)
+ */
+static __u32 wd_sched_domain_get_next_rr(struct wd_sched_ctx_domain *domain)
 {
 	__u32 pos;
+	__u32 ctx_idx;
 
-	pthread_mutex_lock(&region->lock);
+	if (!domain || !domain->segments || domain->total_ctx_count == 0)
+		return INVALID_POS;
 
-	pos = region->last;
+	pthread_mutex_lock(&domain->lock);
+	if (!domain->current_segment)
+		domain->current_segment = domain->segments;
 
-	if (pos < region->end)
-		region->last++;
-	else
-		region->last = region->begin;
+	/* Reset current_pos if it fell outside the current segment */
+	{
+		__u32 seg_len = domain->current_segment->end
+			- domain->current_segment->begin + 1;
+		if (domain->current_pos >= seg_len)
+			domain->current_pos = 0;
+	}
 
-	pthread_mutex_unlock(&region->lock);
+	pos = domain->current_pos;
 
-	return pos;
+	/* Calculate global queue number: segment.begin + relative position */
+	ctx_idx = domain->current_segment->begin + pos;
+
+	/* Move to next position */
+	if (pos + 1 < domain->current_segment->end - domain->current_segment->begin + 1) {
+		/* Within same segment */
+		domain->current_pos = pos + 1;
+	} else if (domain->current_segment->next) {
+		/* Move to next segment */
+		domain->current_segment = domain->current_segment->next;
+		domain->current_pos = 0;
+	} else {
+		/* Loop back to beginning */
+		domain->current_segment = domain->segments;
+		domain->current_pos = 0;
+	}
+
+	pthread_mutex_unlock(&domain->lock);
+	WD_DEBUG("Get next ctx: ctx_idx=%u, current_pos=%u\n", ctx_idx, domain->current_pos);
+
+	return ctx_idx;
 }
 
-/*
- * session_sched_init_ctx - Get one ctx from ctxs by the sched_ctx and arg.
- * @sched_ctx: Schedule ctx, reference the struct sample_sched_ctx.
- * @sched_key: The key of schedule region.
- * @sched_mode: The sched async/sync mode.
- *
- * The user must init the schedule info through wd_sched_rr_instance
+/* ============================================================================
+ * SKey Domain Cache Management Functions
+ * ============================================================================
  */
-static __u32 session_sched_init_ctx(struct wd_sched_ctx *sched_ctx, struct sched_key *key,
-				    const int sched_mode)
+/**
+ * wd_sched_skey_cache_init - Initialize skey domain cache
+ * @cache: Pointer to cache structure
+ * @policy: Scheduling policy
+ * @prop: Context property for LOOP/INSTR modes
+ * 
+ * Initialize fixed array cache with invalid positions and zero loads.
+ */
+static int wd_sched_skey_cache_init(struct wd_sched_domain_idx_cache *cache, __u8 policy, __u8 prop)
 {
-	struct sched_ctx_region *region = NULL;
-	bool ret;
+	int i;
 
-	key->mode = sched_mode;
-	ret = sched_key_valid(sched_ctx, key);
-	if (!ret)
-		return INVALID_POS;
+	if (!cache) {
+		WD_ERR("Invalid cache pointer\n");
+		return -WD_EINVAL;
+	}
 
-	region = sched_get_ctx_range(sched_ctx, key);
-	if (!region)
-		return INVALID_POS;
+	/* Initialize array with invalid positions */
+	for (i = 0; i < SKEY_CTX_MAX_NUM; i++) {
+		cache->idx_list[i] = INVALID_POS;
+		atomic_store(&cache->load_values[i], 0);
+	}
 
-	return sched_get_next_pos_rr(region, NULL);
+	/* Initialize atomic counters */
+	atomic_store(&cache->rr_ptr, 0);
+	atomic_store(&cache->min_load_idx, 0);
+	atomic_store(&cache->op_counter, 0);
+
+	/* Set configuration */
+	cache->valid_count = 0;
+	cache->update_interval = SKEY_LOAD_UPDATE_INTERVAL;
+	cache->policy = policy;
+
+	/* Initialize per-ctx property tracking for LOOP/INSTR modes */
+	if (policy == SCHED_POLICY_LOOP || policy == SCHED_POLICY_HUNGRY ||
+		    policy == SCHED_POLICY_INSTR) {
+		memset(cache->ctx_props, 0, sizeof(cache->ctx_props));
+		for (i = 0; i < 4; i++)
+			atomic_store(&cache->prop_ptrs[i], 0);
+	}
+
+	/* Initialize pick statistics for verifiable policies */
+	if (policy == SCHED_POLICY_LOOP || policy == SCHED_POLICY_INSTR ||
+	    policy == SCHED_POLICY_HUNGRY) {
+		for (i = 0; i < 4; i++)
+			atomic_store(&cache->pick_counts[i], 0);
+	}
+
+	/* Initialize structure lock */
+	if (pthread_mutex_init(&cache->cache_lock, NULL)) {
+		WD_ERR("Failed to init cache lock\n");
+		return -WD_EINVAL;
+	}
+
+	return WD_SUCCESS;
+}
+/**
+ * wd_sched_skey_cache_uninit - Cleanup skey domain cache
+ * @cache: Pointer to cache structure
+ * 
+ * Release resources and reset cache state.
+ */
+
+static void wd_sched_skey_cache_uninit(struct wd_sched_domain_idx_cache *cache)
+{
+	__u32 hw, ce, sve, soft;
+
+	if (!cache)
+		return;
+
+	/* Dump pick statistics for verification before cleanup */
+	if (cache->policy == SCHED_POLICY_LOOP || cache->policy == SCHED_POLICY_INSTR ||
+	    cache->policy == SCHED_POLICY_HUNGRY) {
+		hw   = atomic_load(&cache->pick_counts[UADK_CTX_HW]);
+		ce   = atomic_load(&cache->pick_counts[UADK_CTX_CE_INS]);
+		sve  = atomic_load(&cache->pick_counts[UADK_CTX_SVE_INS]);
+		soft = atomic_load(&cache->pick_counts[UADK_CTX_SOFT]);
+		if (hw + ce + sve + soft > 0)
+			WD_INFO("SCHED_UNINIT_STATS: policy=%d valid=%u HW=%u CE=%u SVE=%u SOFT=%u (total=%u)\n",
+			        cache->policy, cache->valid_count, hw, ce, sve, soft, hw + ce + sve + soft);
+	}
+
+	pthread_mutex_destroy(&cache->cache_lock);
+
+	/* Reset cache state */
+	for (int i = 0; i < SKEY_CTX_MAX_NUM; i++) {
+		cache->idx_list[i] = INVALID_POS;
+		atomic_store(&cache->load_values[i], 0);
+	}
+
+	cache->valid_count = 0;
+}
+/**
+ * wd_sched_skey_add_ctx - Add ctx to skey domain cache
+ * @cache: Pointer to cache structure  
+ * @ctx_id: Context ID to add
+ * 
+ * Add ctx to next available position in fixed array.
+ * Returns 0 on success, negative error code on failure.
+ */
+static int wd_sched_skey_add_ctx(struct wd_sched_domain_idx_cache *cache, __u32 ctx_id, __u8 prop)
+{
+	__u32 i;
+
+	if (!cache || ctx_id == INVALID_POS) {
+		WD_ERR("Invalid parameters\n");
+		return -WD_EINVAL;
+	}
+
+	pthread_mutex_lock(&cache->cache_lock);
+	/* Check if cache is full */
+	if (cache->valid_count >= SKEY_CTX_MAX_NUM) {
+		pthread_mutex_unlock(&cache->cache_lock);
+		WD_ERR("SKey cache full, cannot add more queues\n");
+		return -WD_EINVAL;
+	}
+
+	/* Check for duplicate ctx_id */
+	for (i = 0; i < cache->valid_count; i++) {
+		if (cache->idx_list[i] == ctx_id) {
+			WD_ERR("Context %u already exists in skey cache at position %d\n", ctx_id, i);
+			pthread_mutex_unlock(&cache->cache_lock);
+			return -WD_EEXIST;
+		}
+	}
+
+	/* Update min load index if as the new ctx */
+	atomic_store(&cache->min_load_idx, cache->valid_count);
+
+	/* Add to next available position */
+	cache->idx_list[cache->valid_count] = ctx_id;
+	atomic_store(&cache->load_values[cache->valid_count], 0);
+	if (cache->policy == SCHED_POLICY_LOOP || cache->policy == SCHED_POLICY_HUNGRY ||\
+		    cache->policy == SCHED_POLICY_INSTR)
+		cache->ctx_props[cache->valid_count] = prop;
+	cache->valid_count++;
+	pthread_mutex_unlock(&cache->cache_lock);
+
+	WD_DEBUG("Added ctx %u to skey cache at position %u, list valid_count: %u\n", 
+			ctx_id, cache->valid_count - 1, cache->valid_count);
+
+	return WD_SUCCESS;
 }
 
-static handle_t session_sched_init(handle_t h_sched_ctx, void *sched_param)
+/**
+ * wd_sched_skey_remove_ctx - Remove ctx from skey domain cache
+ * @cache: Pointer to cache structure
+ * @ctx_id: Context ID to remove
+ * 
+ * Remove ctx by shifting array elements to maintain continuity.
+ * Returns 0 on success, negative error code if not found.
+ */
+static int wd_sched_skey_remove_ctx(struct wd_sched_domain_idx_cache *cache,
+                                   __u32 ctx_id)
 {
-	struct wd_sched_ctx *sched_ctx = (struct wd_sched_ctx *)h_sched_ctx;
-	struct sched_params *param = (struct sched_params *)sched_param;
-	struct sched_key *skey;
+	int i, found = 0;
+	__u32 current_min;
+
+	if (!cache) {
+		WD_ERR("Invalid cache pointer\n");
+		return -WD_EINVAL;
+	}
+
+	pthread_mutex_lock(&cache->cache_lock);
+	/* Find and remove the ctx */
+	for (i = 0; i < cache->valid_count; i++) {
+		if (cache->idx_list[i] == ctx_id) {
+			found = 1;
+			break;
+		}
+	}
+
+	if (!found) {
+		WD_ERR("Context %u not found in skey cache\n", ctx_id);
+		pthread_mutex_unlock(&cache->cache_lock);
+		return -WD_ENODEV;
+	}
+
+	/* Shift remaining elements to fill the gap */
+	for (; i < cache->valid_count - 1; i++) {
+		cache->idx_list[i] = cache->idx_list[i + 1];
+		atomic_store(&cache->load_values[i],
+		atomic_load(&cache->load_values[i + 1]));
+		cache->ctx_props[i] = cache->ctx_props[i + 1];
+	}
+
+	/* Clear last position */
+	cache->idx_list[cache->valid_count - 1] = INVALID_POS;
+	atomic_store(&cache->load_values[cache->valid_count - 1], 0);
+	cache->ctx_props[cache->valid_count - 1] = 0;
+	cache->valid_count--;
+
+	/* Reset pointers if cache becomes empty */
+	if (cache->valid_count == 0) {
+		atomic_store(&cache->rr_ptr, 0);
+		atomic_store(&cache->min_load_idx, 0);
+	} else {
+		/* Adjust min load index if necessary */
+		current_min = atomic_load(&cache->min_load_idx);
+		if (current_min >= cache->valid_count)
+	    		atomic_store(&cache->min_load_idx, 0);
+	}
+	pthread_mutex_unlock(&cache->cache_lock);
+	WD_DEBUG("Removed ctx %u from skey cache, valid_count: %u\n",
+	     ctx_id, cache->valid_count);
+
+	return WD_SUCCESS;
+}
+
+/**
+ * wd_sched_update_min_load - Update cached min load index
+ * @cache: Pointer to cache structure
+ * 
+ * Scan valid queues to find the one with minimum load.
+ * Called periodically to avoid frequent scanning.
+ */
+static void wd_sched_update_min_load(struct wd_sched_domain_idx_cache *cache)
+{
+	__u32 min_load = UINT_MAX;
+	__u32 min_idx = 0;
+	__u32 i, load;
+
+	if (cache->valid_count == 0)
+		return;
+
+	/* Simple linear scan - efficient for small arrays */
+	for (i = 0; i < cache->valid_count; i++) {
+		load = atomic_load(&cache->load_values[i]);
+		if (load < min_load) {
+	   		min_load = load;
+	    		min_idx = i;
+		}
+	}
+
+	atomic_store(&cache->min_load_idx, min_idx);
+}
+
+/**
+ * wd_sched_skey_pick_next - Pick next ctx from skey domain cache
+ * @cache: Pointer to cache structure
+ * 
+ * Select next ctx based on scheduling policy:
+ * - RR: Simple round-robin selection
+ * - LOAD_BALANCE: Choose ctx with minimum load
+ * 
+ * Returns selected ctx index, or INVALID_POS if no valid ctx.
+ */
+static __u32 wd_sched_skey_pick_next(struct wd_sched_domain_idx_cache *cache, __u32 *ctx_idx)
+{
+	__u32 selected_idx;
+	__u32 op_count;
+
+	if (!cache || cache->valid_count == 0) {
+		return INVALID_POS;
+	}
+
+	switch (cache->policy) {
+	case SCHED_POLICY_RR:
+	case SCHED_POLICY_NONE:
+	case SCHED_POLICY_SINGLE:
+	case SCHED_POLICY_DEV:
+	case SCHED_POLICY_LOOP:
+	case SCHED_POLICY_INSTR:
+		/* Round-robin: atomic increment and modulo */
+		selected_idx = atomic_fetch_add(&cache->rr_ptr, 1) % cache->valid_count;
+		break;
+	case SCHED_POLICY_HUNGRY:
+		/* Update min load periodically */
+		op_count = atomic_fetch_add(&cache->op_counter, 1);
+		if (op_count % cache->update_interval == 0)
+			wd_sched_update_min_load(cache);
+
+		/* Load balancing: use cached min load index */
+		selected_idx = atomic_load(&cache->min_load_idx);
+		break;
+	default:
+		WD_ERR("Unknown scheduling policy: %d\n", cache->policy);
+		selected_idx = INVALID_POS;
+		break;
+	}
+
+	/* Ensure index is within valid range */
+	if (selected_idx >= cache->valid_count)
+		return INVALID_POS;
+
+	*ctx_idx = selected_idx;
+	/* Track per-prop pick statistics for debug verification */
+	if (cache->ctx_props[selected_idx] < UADK_CTX_MAX)
+		atomic_fetch_add(&cache->pick_counts[cache->ctx_props[selected_idx]], 1);
+	return cache->idx_list[selected_idx];
+}
+
+/**
+ * wd_sched_skey_update_load - Update load for a specific ctx
+ * @cache: Pointer to cache structure
+ * @ctx_idx: Context index in list
+ * @delta: Load delta (positive for send, negative for receive)
+ * 
+ * Atomically update load counter for the specified ctx.
+ * Returns 0 on success, negative error code if ctx not found.
+ */
+static int wd_sched_skey_update_load(struct wd_sched_domain_idx_cache *cache,
+                                    __u32 ctx_idx, int delta)
+{
+	/* Atomic update without locking */
+	if (delta > 0)
+		atomic_fetch_add(&cache->load_values[ctx_idx], delta);
+	else
+		atomic_fetch_sub(&cache->load_values[ctx_idx], -delta);
+	return WD_SUCCESS;
+}
+
+/* ============================================================================
+ * Session Key Domain Initialization
+ * ============================================================================
+ */
+
+/**
+ * wd_sched_skey_domain_init - Initialize session domain with min-heap
+ * @key_domain: Target key domain
+ * @ctx_idx: context indices idx
+ * @policy: current session's policy
+ *
+ * Initializes dual-domain structure for session.
+ */
+static int wd_sched_skey_domain_init(struct wd_sched_key_domain *key_domain,
+                                    __u32 ctx_idx,    __u8 policy, __u8 prop)
+{
+	int ret;
+
+	if (!key_domain)
+		return -WD_EINVAL;
+
+	ret = wd_sched_skey_cache_init(&key_domain->idx_cache, policy, prop);
+	if (ret)
+		return ret;
+
+	ret = wd_sched_skey_add_ctx(&key_domain->idx_cache, ctx_idx, prop);
+	if (ret)
+		goto init_err;
+
+	ret = pthread_mutex_init(&key_domain->lock, NULL);
+	if (ret) {
+		goto add_ctx_err;
+	}
+
+	key_domain->expanded_count = 0;
+	atomic_store(&key_domain->pending_count, 0);
+
+	return 0;
+
+add_ctx_err:
+	wd_sched_skey_remove_ctx(&key_domain->idx_cache, ctx_idx);
+init_err:
+	wd_sched_skey_cache_uninit(&key_domain->idx_cache);
+	return ret;
+}
+
+/**
+ * wd_sched_skey_domain_destroy - Release session domain resources
+ */
+static void wd_sched_skey_domain_destroy(struct wd_sched_key_domain *key_domain)
+{
+	if (!key_domain)
+		return;
+
+	pthread_mutex_destroy(&key_domain->lock);
+	wd_sched_skey_cache_uninit(&key_domain->idx_cache);
+}
+
+/* Forward declaration for session ctx init */
+static __u32 session_sched_init_ctx(struct wd_sched_ctx *sched_ctx,
+	struct wd_sched_key *skey, const int sched_mode);
+
+/**
+ * wd_sched_find_compat_ctx - Find compatible ctx by iterating all prop types
+ * @sched_ctx: Scheduler context
+ * @skey: Session key (contains region_id, type, alg_name, ctxs)
+ * @sched_mode: Scheduling mode (SYNC/ASYNC)
+ *
+ * Iterates through all driver types (HW -> CE -> SVE -> SOFT -> NPU -> GPU)
+ * and returns the first compatible ctx index found.
+ * Returns: Compatible ctx index, or INVALID_POS if not found.
+ */
+static __u32 wd_sched_find_compat_ctx(struct wd_sched_ctx *sched_ctx,
+	struct wd_sched_key *skey, const int sched_mode)
+{
+	__u8 prop;
+	struct wd_sched_ctx_domain *domain;
+	__u32 ctx_idx;
+	int i;
+
+	if (!sched_ctx || !skey || !skey->alg_name || !skey->ctxs)
+		return INVALID_POS;
+
+	if (!sched_ctx->domain_hash_table)
+		return INVALID_POS;
+
+	/* Iterate all driver types, start from HW */
+	for (prop = UADK_ALG_HW; prop < UADK_ALG_TYPE_MAX; prop++) {
+		domain = wd_sched_hash_table_lookup(sched_ctx->domain_hash_table,
+						    skey->region_id, sched_mode, skey->type, prop);
+		if (!domain || !domain->valid)
+			continue;
+
+		/* Iterate all ctxs in this domain to find compatible one */
+		for (i = 0; i < domain->total_ctx_count; i++) {
+			ctx_idx = wd_sched_domain_get_next_rr(domain);
+			if (ctx_idx == INVALID_POS)
+				break;
+			if (skey->ctxs[ctx_idx].drv &&
+			    wd_alg_match_drv(skey->ctxs[ctx_idx].drv, skey->alg_name))
+				return ctx_idx;
+		}
+	}
+
+	return INVALID_POS;
+}
+
+/**
+ * wd_sched_skey_compat_filter - Filter and replace incompatible ctxs in domain cache
+ * @sched_ctx: Scheduler context
+ * @skey: Session key with alg_name and ctxs
+ * @domain: Target domain (sync or async)
+ * @sched_mode: SCHED_MODE_SYNC or SCHED_MODE_ASYNC
+ *
+ * For each ctx in domain cache, check if it supports alg_name.
+ * If not, find a compatible replacement from the global domain.
+ */
+static void wd_sched_skey_compat_filter(struct wd_sched_ctx *sched_ctx,
+	struct wd_sched_key *skey, struct wd_sched_key_domain *domain, int sched_mode)
+{
+	__u32 ctx_idx, new_ctx;
+	int i;
+
+	if (!skey || !skey->alg_name || !skey->ctxs || !domain)
+		return;
+
+	/* Skip uninitialized domains (no ctxs cached) */
+	if (domain->idx_cache.valid_count == 0)
+		return;
+
+	pthread_mutex_lock(&domain->lock);
+
+	for (i = 0; i < domain->idx_cache.valid_count; i++) {
+		ctx_idx = domain->idx_cache.idx_list[i];
+
+		/* Skip invalid ctx index */
+		if (ctx_idx == INVALID_POS)
+			continue;
+
+		/* Skip if ctxs array or drv is NULL - safety check */
+		if (!skey->ctxs || !skey->ctxs[ctx_idx].drv)
+			continue;
+
+		/* Check if current ctx is compatible */
+		if (wd_alg_match_drv(skey->ctxs[ctx_idx].drv, skey->alg_name)) {
+			/* Compatible, keep unchanged */
+			continue;
+		}
+
+		/* Not compatible, find a replacement by iterating all prop types */
+		new_ctx = wd_sched_find_compat_ctx(sched_ctx, skey, sched_mode);
+
+		if (new_ctx != INVALID_POS && new_ctx != ctx_idx) {
+			/* Found compatible ctx, replace */
+			domain->idx_cache.idx_list[i] = new_ctx;
+			atomic_store(&domain->idx_cache.load_values[i], 0);
+			WD_DEBUG("replaced ctx %u with compat ctx %u\n", ctx_idx, new_ctx);
+		} else {
+			/* No compatible ctx found, mark as invalid */
+			domain->idx_cache.idx_list[i] = INVALID_POS;
+			WD_ERR("no compatible ctx found for alg %s\n", skey->alg_name);
+		}
+	}
+
+	pthread_mutex_unlock(&domain->lock);
+}
+
+/**
+ * wd_sched_poll_skey - Poll contexts for scheduler session
+ * @sched_ctx: Scheduler context
+ * @skey: Session key
+ * @expect: Expected number of responses
+ * @count: Actual response count (output)
+ *
+ * Polls all contexts in session domains and updates load values.
+ */
+static int wd_sched_poll_skey(struct wd_sched_ctx *sched_ctx, struct wd_sched_key *skey,
+			 __u32 expect, __u32 *count)
+{
+	__u32 sum_poll_num = 0;
+	__u32 poll_num;
+	__u32 idx, i;
+	int ret;
+
+	/* Poll async domain contexts (lock to protect against concurrent add/remove) */
+	pthread_mutex_lock(&skey->async_domain.idx_cache.cache_lock);
+	for (i = 0; i < skey->async_domain.idx_cache.valid_count; i++) {
+		idx = skey->async_domain.idx_cache.idx_list[i];
+
+		poll_num = 0;
+		ret = sched_ctx->poll_func(idx, expect, &poll_num);
+		if ((ret < 0) && (ret != -EAGAIN)) {
+			pthread_mutex_unlock(&skey->async_domain.idx_cache.cache_lock);
+			return ret;
+		}
+
+		if (poll_num > 0) {
+			sum_poll_num += poll_num;
+			/* Decrement pending count for successfully polled requests */
+			int pending = atomic_load(&skey->async_domain.pending_count);
+			if (pending >= (int)poll_num)
+				atomic_fetch_sub(&skey->async_domain.pending_count, poll_num);
+			else
+				atomic_store(&skey->async_domain.pending_count, 0);
+		}
+
+		/* Update load value for this context */
+		if (skey->async_domain.idx_cache.policy == SCHED_POLICY_HUNGRY)
+			wd_sched_skey_update_load(&skey->async_domain.idx_cache, i, -poll_num);
+	}
+	pthread_mutex_unlock(&skey->async_domain.idx_cache.cache_lock);
+	*count = sum_poll_num;
+
+	return 0;
+}
+
+/* ============================================================================
+ * Utility Functions
+ * ============================================================================
+ */
+
+static void sched_skey_param_init(struct wd_sched_ctx *sched_ctx, struct wd_sched_key *skey)
+{
+	__u32 i;
+
+	pthread_mutex_lock(&sched_ctx->skey_lock);
+	for (i = 0; i < SKEY_MAX_THREAD_NUM; i++) {
+		if (sched_ctx->skey[i] == NULL) {
+			sched_ctx->skey[i] = skey;
+			sched_ctx->skey_num++;
+			pthread_mutex_unlock(&sched_ctx->skey_lock);
+			WD_ERR("success: get valid skey node[%u]!\n", i);
+			return;
+		}
+	}
+	pthread_mutex_unlock(&sched_ctx->skey_lock);
+	WD_ERR("invalid: skey node number is too much!\n");
+}
+
+static handle_t sched_session_common_init(struct wd_sched_ctx *sched_ctx,
+	struct sched_params *param)
+{
+	struct wd_sched_key *skey;
 	unsigned int node;
 
 	if (getcpu(NULL, &node)) {
 		WD_ERR("failed to get node, errno %d!\n", errno);
 		return (handle_t)(-errno);
-	}
-	if (node == (unsigned int)NUMA_NO_NODE) {
-		WD_ERR("invalid: failed to get numa node!\n");
-		return (handle_t)(-WD_EINVAL);
 	}
 
 	if (!sched_ctx) {
@@ -193,133 +1176,223 @@ static handle_t session_sched_init(handle_t h_sched_ctx, void *sched_param)
 		return (handle_t)(-WD_EINVAL);
 	}
 
-	skey = malloc(sizeof(struct sched_key));
+	skey = malloc(sizeof(struct wd_sched_key));
 	if (!skey) {
 		WD_ERR("failed to alloc memory for session sched key!\n");
 		return (handle_t)(-WD_ENOMEM);
 	}
+	memset(skey, 0, sizeof(struct wd_sched_key));
 
 	if (!param) {
-		memset(skey, 0, sizeof(struct sched_key));
-		skey->numa_id = sched_ctx->numa_map[node];
+		skey->region_id = node;
 		if (wd_need_debug())
 			WD_DEBUG("session don't set scheduler parameters!\n");
-	} else if (param->numa_id < 0) {
-		skey->type = param->type;
-		skey->numa_id = sched_ctx->numa_map[node];
 	} else {
+		if (param->numa_id >= 0) {
+			skey->region_id = param->numa_id;
+		} else {
+			skey->region_id = node;
+		}
 		skey->type = param->type;
-		skey->numa_id = param->numa_id;
-	}
-
-	if (skey->numa_id < 0) {
-		WD_ERR("failed to get valid sched numa region!\n");
-		goto out;
-	}
-
-	skey->sync_ctxid = session_sched_init_ctx(sched_ctx, skey, CTX_MODE_SYNC);
-	skey->async_ctxid = session_sched_init_ctx(sched_ctx, skey, CTX_MODE_ASYNC);
-	if (skey->sync_ctxid == INVALID_POS && skey->async_ctxid == INVALID_POS) {
-		WD_ERR("failed to get valid sync_ctxid or async_ctxid!\n");
-		goto out;
+		skey->ctx_prop = param->ctx_prop;
 	}
 
 	return (handle_t)skey;
-
-out:
-	free(skey);
-	return (handle_t)(-WD_EINVAL);
 }
 
-/*
- * session_pick_next_ctx - Get one ctx from ctxs by the sched_ctx and arg.
- * @sched_ctx: Schedule ctx, reference the struct sample_sched_ctx.
- * @sched_key: The key of schedule region.
- * @sched_mode: The sched async/sync mode.
+
+/**
+ * session_sched_init_ctx - Pre-fetch single context from domain for session
+ * @sched_ctx: Scheduler context
+ * @skey: Session key (contains region_id, type, ctx_prop)
+ * @sched_mode: Mode (SYNC/ASYNC)
  *
- * The user must init the schedule info through session_sched_init
+ * Returns: Next RR context index from specified domain.
+ * Note: This function only does simple RR selection from a single prop domain.
+ * For compat filtering (iterating all prop types), use wd_sched_find_compat_ctx.
  */
-static __u32 session_sched_pick_next_ctx(handle_t h_sched_ctx, void *sched_key,
+static __u32 session_sched_init_ctx(struct wd_sched_ctx *sched_ctx,
+	struct wd_sched_key *skey, const int sched_mode)
+{
+	struct wd_sched_ctx_domain *domain = NULL;
+
+	if (!skey)
+		return INVALID_POS;
+
+	if (skey->region_id >= sched_ctx->region_num || sched_mode >= SCHED_MODE_BUTT ||
+	     skey->type >= sched_ctx->type_num || skey->ctx_prop >= UADK_ALG_TYPE_MAX) {
+		WD_ERR("invalid: region: %d, mode: %d, type: %u!, prop: %u\n",
+		       skey->region_id, sched_mode, skey->type, skey->ctx_prop);
+		return INVALID_POS;
+	}
+
+	if (!sched_ctx->domain_hash_table)
+		return INVALID_POS;
+
+	domain = wd_sched_hash_table_lookup(sched_ctx->domain_hash_table,
+					      skey->region_id, sched_mode, skey->type, skey->ctx_prop);
+	if (!domain || !domain->valid)
+		return INVALID_POS;
+
+	/* Simple RR selection from the specified domain */
+	return wd_sched_domain_get_next_rr(domain);
+}
+
+/**
+ * session_sched_domain_destroy - Destroy session domains
+ * @skey: Session key to destroy domains for
+ *
+ * Releases all resources associated with session domains.
+ */
+
+/**
+ * session_sched_domain_init - Initialize session domains with sync/async contexts
+ * @sched_ctx: Scheduler context
+ * @skey: Session key to initialize
+ *
+ * Pre-fetches sync and async contexts and initializes corresponding domains.
+ * Returns: 0 on success, negative error code on failure.
+ */
+static int session_sched_domain_init(struct wd_sched_ctx *sched_ctx, 
+                                        struct wd_sched_key *skey)
+{
+	__u32 sync_ctx, async_ctx;
+
+	if (!sched_ctx || !skey) {
+		WD_ERR("invalid: sched_ctx or skey is NULL!\n");
+		return -WD_EINVAL;
+	}
+
+	/* Pre-fetch one sync context */
+	sync_ctx = session_sched_init_ctx(sched_ctx, skey, SCHED_MODE_SYNC);
+
+	/* Pre-fetch one async context */
+	async_ctx = session_sched_init_ctx(sched_ctx, skey, SCHED_MODE_ASYNC);
+
+	if (sync_ctx == INVALID_POS && async_ctx == INVALID_POS) {
+		WD_ERR("there is no valid sync_ctx or async_ctx domain!\n");
+		return -WD_EINVAL;
+	}
+
+	WD_DEBUG("Got ctx index sync_ctx=%u, async_ctx=%u\n", 		sync_ctx, async_ctx);
+
+	/* Initialize sync domain if context is valid */
+	if (sync_ctx != INVALID_POS) {
+		if (wd_sched_skey_domain_init(&skey->sync_domain, sync_ctx, sched_ctx->policy, skey->ctx_prop) != 0) {
+			WD_ERR("failed to init sync domain!\n");
+			return -WD_EINVAL;
+		}
+	}
+
+	/* Initialize async domain if context is valid */
+	if (async_ctx != INVALID_POS) {
+		if (wd_sched_skey_domain_init(&skey->async_domain, async_ctx, sched_ctx->policy, skey->ctx_prop) != 0) {
+			WD_ERR("failed to init async domain!\n");
+			/* Cleanup sync domain if async domain init failed */
+			if (sync_ctx != INVALID_POS)
+				wd_sched_skey_domain_destroy(&skey->sync_domain);
+			return -WD_EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+/* ============================================================================
+ * Scheduler Policy Functions
+ * ============================================================================
+ */
+/**
+ * round_robin_sched_init - Initialize session with single sync and async ctx
+ * @h_sched_ctx: Scheduler handle (cannot modify per API contract)
+ * @sched_param: Scheduling parameters (cannot modify per API contract)
+ *
+ * Allocates session key and pre-fetches one sync and one async context.
+ */
+static handle_t round_robin_sched_init(handle_t h_sched_ctx, void *sched_param)
+{
+	struct wd_sched_ctx *sched_ctx = (struct wd_sched_ctx *)h_sched_ctx;
+	struct sched_params *param = (struct sched_params *)sched_param;
+	struct wd_sched_key *skey;
+	handle_t hskey;
+	int ret = 0;
+
+	hskey = sched_session_common_init(sched_ctx, param);
+	if (WD_IS_ERR(hskey)) {
+		WD_ERR("failed to init session schedule key!\n");
+		return hskey;
+	}
+
+	skey = (struct wd_sched_key *)hskey;
+	ret = session_sched_domain_init(sched_ctx, skey);
+	if (ret != 0) {
+		WD_ERR("failed to initialize session domains!\n");
+		free(skey);
+		return (handle_t)(-WD_EINVAL);
+	}
+
+	sched_skey_param_init(sched_ctx, skey);	
+	WD_INFO("initialized RR scheduler with sync and async domains\n");
+
+	return hskey;
+}
+
+/**
+ * round_robin_pick_next_ctx - Pick context with load-based selection
+ * @h_sched_ctx: Scheduler handle (cannot modify per API contract)
+ * @sched_key: Session key (cannot modify per API contract)
+ * @sched_mode: Mode (cannot modify per API contract)
+ *
+ * Returns: Context index with minimum load
+ * Time complexity: O(1)
+ */
+static __u32 round_robin_pick_next_ctx(handle_t h_sched_ctx, void *sched_key,
 					 const int sched_mode)
 {
-	struct sched_key *key = (struct sched_key *)sched_key;
+	struct wd_sched_key *skey = (struct wd_sched_key *)sched_key;
+	struct wd_sched_key_domain *domain;
+	__u32 min_ctx, ctx_idx;
 
-	if (unlikely(!h_sched_ctx || !key)) {
+	if (unlikely(!h_sched_ctx || !skey)) {
 		WD_ERR("invalid: sched ctx or key is NULL!\n");
 		return INVALID_POS;
 	}
 
-	/* return  in do task */
-	if (sched_mode == CTX_MODE_SYNC)
-		return key->sync_ctxid;
-	return key->async_ctxid;
-}
-
-static int session_poll_region(struct wd_sched_ctx *sched_ctx, __u32 begin,
-			       __u32 end, __u32 expect, __u32 *count)
-{
-	__u32 poll_num = 0;
-	__u32 i;
-	int ret;
-
-	/* i is the pos of sched_ctxs, the max is end */
-	for (i = begin; i <= end; i++) {
-		/*
-		 * RR schedule, one time poll one package,
-		 * poll_num is always not more than one here.
-		 */
-		ret = sched_ctx->poll_func(i, 1, &poll_num);
-		if ((ret < 0) && (ret != -EAGAIN))
-			return ret;
-		else if (ret == -EAGAIN)
-			continue;
-		*count += poll_num;
-		if (*count == expect)
-			break;
+	if (sched_mode == SCHED_MODE_SYNC) {
+		domain = &skey->sync_domain;
+	} else {
+		domain = &skey->async_domain;
+		/* Increment pending count for async mode to indicate pending request */
+		atomic_fetch_add(&domain->pending_count, 1);
 	}
 
-	return 0;
+	/* Get current minimum load context */
+	min_ctx = wd_sched_skey_pick_next(&domain->idx_cache, &ctx_idx);
+	if (min_ctx == INVALID_POS)
+		return INVALID_POS;
+
+	return min_ctx;
 }
 
-static int session_poll_policy_rr(struct wd_sched_ctx *sched_ctx, int numa_id,
-				  __u32 expect, __u32 *count)
-{
-	struct sched_ctx_region **region = sched_ctx->sched_info[numa_id].ctx_region;
-	__u32 begin, end;
-	__u32 i;
-	int ret;
-
-	for (i = 0; i < sched_ctx->type_num; i++) {
-		if (!region[SCHED_MODE_ASYNC][i].valid)
-			continue;
-
-		begin = region[SCHED_MODE_ASYNC][i].begin;
-		end = region[SCHED_MODE_ASYNC][i].end;
-		ret = session_poll_region(sched_ctx, begin, end, expect, count);
-		if (unlikely(ret))
-			return ret;
-	}
-
-	return 0;
-}
-
-/*
- * session_poll_policy - The polling policy matches the pick next ctx.
- * @sched_ctx: Schedule ctx, reference the struct sample_sched_ctx.
- * @cfg: The global resoure info.
- * @expect: User expect poll msg num.
- * @count: The actually poll num.
+/**
+ * round_robin_poll_policy - Poll policy for session scheduler
+ * @h_sched_ctx: Scheduler handle (cannot modify per API contract)
+ * @expect: Expected number of responses (cannot modify per API contract)
+ * @count: Actual response count (cannot modify per API contract)
  *
- * The user must init the schedule info through wd_sched_rr_instance, the
- * func interval will not check the valid, becouse it will affect performance.
+ * Returns: Status code
  */
-static int session_sched_poll_policy(handle_t h_sched_ctx, __u32 expect, __u32 *count)
+static int round_robin_poll_policy(handle_t h_sched_ctx, __u32 expect, __u32 *count)
 {
 	struct wd_sched_ctx *sched_ctx = (struct wd_sched_ctx *)h_sched_ctx;
-	struct wd_sched_info *sched_info;
-	__u32 loop_time = 0;
-	__u32 last_count = 0;
-	__u16 i, region_mum;
+	__u32 skey_num = sched_ctx->skey_num;
+	struct wd_sched_key *skey;
+	__u32 tid = pthread_self();
+	__u16 i, tpos, start_pos;
+	__u32 poll_num, sum_count = 0;
+
+	if (unlikely(!skey_num))
+		return 0;
 	int ret;
 
 	if (unlikely(!count || !sched_ctx || !sched_ctx->poll_func)) {
@@ -327,46 +1400,27 @@ static int session_sched_poll_policy(handle_t h_sched_ctx, __u32 expect, __u32 *
 		return -WD_EINVAL;
 	}
 
-	if (unlikely(sched_ctx->numa_num > NUMA_NUM_NODES)) {
-		WD_ERR("invalid: ctx's numa number is %u!\n", sched_ctx->numa_num);
-		return -WD_EINVAL;
+	/* Optimize thread stagger using shift instead of modulo */
+	start_pos = (tid >> 3) % skey_num;
+
+	/* Query the queues on each skey separately. */
+	for (i = 0; i < skey_num; i++) {
+		tpos = (start_pos + i) % skey_num;
+		skey = sched_ctx->skey[tpos];
+
+		/* Skip session if no pending requests */
+		if (atomic_load(&skey->async_domain.pending_count) <= 0)
+			continue;
+
+		ret = wd_sched_poll_skey(sched_ctx, skey, expect, &poll_num);
+		if (unlikely(ret))
+			return ret;
+
+		sum_count += poll_num;
+		if (sum_count >= expect)
+			break;
 	}
-
-	sched_info = sched_ctx->sched_info;
-	if (sched_ctx->policy == SCHED_POLICY_DEV)
-		region_mum = sched_ctx->dev_num;
-	else
-		region_mum = sched_ctx->numa_num;
-
-	/*
-	 * Try different region's ctx if we can't receive any
-	 * package last time, it is more efficient. In most
-	 * bad situation, poll ends after MAX_POLL_TIMES loop.
-	 */
-	while (++loop_time < MAX_POLL_TIMES) {
-		for (i = 0; i < region_mum;) {
-			/* If current numa is not valid, find next. */
-			if (!sched_info[i].valid) {
-				i++;
-				continue;
-			}
-
-			last_count = *count;
-			ret = session_poll_policy_rr(sched_ctx, i, expect, count);
-			if (unlikely(ret))
-				return ret;
-
-			if (expect == *count)
-				return 0;
-
-			/*
-			 * If no package is received, find next numa,
-			 * otherwise, keep receiving packets at this node.
-			 */
-			if (last_count == *count)
-				i++;
-		}
-	}
+	*count = sum_count;
 
 	return 0;
 }
@@ -396,7 +1450,6 @@ static int sched_none_poll_policy(handle_t h_sched_ctx,
 	}
 
 	while (loop_times > 0) {
-		/* Default use ctx 0 */
 		loop_times--;
 		ret = sched_ctx->poll_func(0, 1, &poll_num);
 		if ((ret < 0) && (ret != -EAGAIN))
@@ -420,13 +1473,10 @@ static handle_t sched_single_init(handle_t h_sched_ctx, void *sched_param)
 static __u32 sched_single_pick_next_ctx(handle_t sched_ctx,
 					void *sched_key, const int sched_mode)
 {
-#define CTX_ASYNC		1
-#define CTX_SYNC		0
-
 	if (sched_mode)
-		return CTX_ASYNC;
+		return 1;
 	else
-		return CTX_SYNC;
+		return 0;
 }
 
 static int sched_single_poll_policy(handle_t h_sched_ctx,
@@ -443,7 +1493,6 @@ static int sched_single_poll_policy(handle_t h_sched_ctx,
 	}
 
 	while (loop_times > 0) {
-		/* Default async mode use ctx 1 */
 		loop_times--;
 		ret = sched_ctx->poll_func(1, 1, &poll_num);
 		if ((ret < 0) && (ret != -EAGAIN))
@@ -459,257 +1508,130 @@ static int sched_single_poll_policy(handle_t h_sched_ctx,
 	return 0;
 }
 
-static bool sched_dev_key_valid(struct wd_sched_ctx *sched_ctx, const struct sched_key *key)
-{
-	bool found = false;
-	int i;
 
-	if (key->mode >= SCHED_MODE_BUTT || key->type >= sched_ctx->type_num) {
-		WD_ERR("invalid: sched key's device id: %u, mode: %u, type: %u!\n",
-		       key->dev_id, key->mode, key->type);
-		return false;
-	}
-
-	for (i = 0; i < sched_ctx->dev_num; i++) {
-		if (key->dev_id == sched_ctx->dev_id_map[i].dev_id) {
-			found = true;
-			break;
-		}
-	}
-
-	if (!found) {
-		WD_ERR("invalid: dev_id %u is not registered!\n", key->dev_id);
-		return false;
-	}
-
-	return true;
-}
-
-/*
- * sched_dev_get_region - Get ctx region from ctx_map by the wd comp arg
- */
-static struct sched_ctx_region *sched_dev_get_region(struct wd_sched_ctx *sched_ctx,
-						    const struct sched_key *key)
-{
-	struct wd_sched_info *sched_info;
-	int i, region_id;
-
-	for (i = 0; i < sched_ctx->dev_num; i++) {
-		if (key->dev_id == sched_ctx->dev_id_map[i].dev_id) {
-			region_id = sched_ctx->dev_id_map[i].region_id;
-			sched_info = &sched_ctx->sched_info[region_id];
-			if (sched_info->ctx_region[key->mode][key->type].valid)
-				return &sched_info->ctx_region[key->mode][key->type];
-		}
-	}
-
-	/*
-	 * If the scheduling domain of dev_id does not exist,
-	 * taskes operations cannot be executed using queues from other devices;
-	 * otherwise, an SMMU error will occur.
-	 */
-	return NULL;
-}
-
-/*
- * session_dev_sched_init_ctx - Get one ctx from ctxs by the sched_ctx and arg.
- * @sched_ctx: Schedule ctx, reference the struct sample_sched_ctx.
- * @sched_key: The key of schedule region.
- * @sched_mode: The sched async/sync mode.
- *
- * The user must init the schedule info through wd_sched_rr_instance
- */
-static __u32 session_dev_sched_init_ctx(struct wd_sched_ctx *sched_ctx, struct sched_key *key,
-				    const int sched_mode)
-{
-	struct sched_ctx_region *region = NULL;
-	bool ret;
-
-	key->mode = sched_mode;
-	ret = sched_dev_key_valid(sched_ctx, key);
-	if (!ret)
-		return INVALID_POS;
-
-	region = sched_dev_get_region(sched_ctx, key);
-	if (!region)
-		return INVALID_POS;
-
-	return sched_get_next_pos_rr(region, NULL);
-}
 
 static handle_t session_dev_sched_init(handle_t h_sched_ctx, void *sched_param)
 {
 	struct wd_sched_ctx *sched_ctx = (struct wd_sched_ctx *)h_sched_ctx;
 	struct sched_params *param = (struct sched_params *)sched_param;
-	struct sched_key *skey;
-	unsigned int node;
+	struct wd_sched_key *skey;
+	handle_t hskey;
+	int ret = 0;
 
-	if (getcpu(NULL, &node)) {
-		WD_ERR("failed to get numa node, errno %d!\n", errno);
-		return (handle_t)(-errno);
-	}
-	if (node == (unsigned int)NUMA_NO_NODE) {
-		WD_ERR("invalid: failed to get numa node for dev sched init!\n");
-		return (handle_t)(-WD_EINVAL);
+	hskey = sched_session_common_init(sched_ctx, param);
+	if (WD_IS_ERR(hskey)) {
+		WD_ERR("failed to init session schedule key!\n");
+		return hskey;
 	}
 
-	if (!sched_ctx) {
-		WD_ERR("invalid: sched ctx is NULL!\n");
-		return (handle_t)(-WD_EINVAL);
-	}
-
-	if (!param) {
-		WD_DEBUG("no-sva session don't set scheduler parameters!\n");
-		return (handle_t)(-WD_EINVAL);
-	}
-
-	skey = malloc(sizeof(struct sched_key));
-	if (!skey) {
-		WD_ERR("failed to alloc memory for session sched key!\n");
-		return (handle_t)(-WD_ENOMEM);
-	}
-
+	skey = (struct wd_sched_key *)hskey;
 	skey->type = param->type;
-	skey->dev_id = param->dev_id;
 
-	skey->sync_ctxid = session_dev_sched_init_ctx(sched_ctx, skey, CTX_MODE_SYNC);
-	skey->async_ctxid = session_dev_sched_init_ctx(sched_ctx, skey, CTX_MODE_ASYNC);
-	if (skey->sync_ctxid == INVALID_POS && skey->async_ctxid == INVALID_POS) {
-		WD_ERR("failed to get valid sync_ctxid or async_ctxid!\n");
-		goto out;
+	ret = session_sched_domain_init(sched_ctx, skey);
+	if (ret != 0) {
+		WD_ERR("failed to initialize session domains!\n");
+		free(skey);
+		return (handle_t)(-WD_EINVAL);
 	}
 
+	sched_skey_param_init(sched_ctx, skey);	
+	WD_INFO("initialized Dev RR scheduler with sync and async domains\n");
 	return (handle_t)skey;
-
-out:
-	free(skey);
-	return (handle_t)(-WD_EINVAL);
 }
 
+/**
+ * wd_sched_set_param - Set scheduler parameters
+ * @h_sched_ctx: Scheduler handle (cannot modify per API contract)
+ * @sched_key: Session key (cannot modify per API contract)
+ * @sched_param: Scheduling parameters (cannot modify per API contract)
+ */
+
+static void wd_sched_set_param(handle_t h_sched_ctx,
+		void *sched_key, void *sched_param)
+{
+	struct wd_sched_params *params = (struct wd_sched_params *)sched_param;
+	struct wd_sched_key *skey = (struct wd_sched_key *)sched_key;
+	struct wd_sched_ctx *sched_ctx = (struct wd_sched_ctx *)h_sched_ctx;
+
+	skey->pkt_size = params->pkt_size;
+	skey->is_stream = params->data_mode;
+	skey->prio_mode = params->prio_mode;
+
+	/* Store compat filtering parameters */
+	skey->alg_name = params->alg_name;
+	skey->ctxs = params->ctxs;
+
+	/* If compat info provided, fix up pre-fetched ctxs */
+	if (skey->alg_name && skey->ctxs) {
+		wd_sched_skey_compat_filter(sched_ctx, skey,
+			&skey->sync_domain, SCHED_MODE_SYNC);
+		wd_sched_skey_compat_filter(sched_ctx, skey,
+			&skey->async_domain, SCHED_MODE_ASYNC);
+	}
+}
 static struct wd_sched sched_table[SCHED_POLICY_BUTT] = {
 	{
 		.name = "RR scheduler",
 		.sched_policy = SCHED_POLICY_RR,
-		.sched_init = session_sched_init,
-		.pick_next_ctx = session_sched_pick_next_ctx,
-		.poll_policy = session_sched_poll_policy,
+		.sched_init = round_robin_sched_init,
+		.pick_next_ctx = round_robin_pick_next_ctx,
+		.poll_policy = round_robin_poll_policy,
+		.set_param = wd_sched_set_param,
 	}, {
 		.name = "None scheduler",
 		.sched_policy = SCHED_POLICY_NONE,
 		.sched_init = sched_none_init,
 		.pick_next_ctx = sched_none_pick_next_ctx,
 		.poll_policy = sched_none_poll_policy,
+		.set_param = wd_sched_set_param,
 	}, {
 		.name = "Single scheduler",
 		.sched_policy = SCHED_POLICY_SINGLE,
 		.sched_init = sched_single_init,
 		.pick_next_ctx = sched_single_pick_next_ctx,
 		.poll_policy = sched_single_poll_policy,
+		.set_param = wd_sched_set_param,
 	}, {
 		.name = "Device RR scheduler",
 		.sched_policy = SCHED_POLICY_DEV,
 		.sched_init = session_dev_sched_init,
-		.pick_next_ctx = session_sched_pick_next_ctx,
-		.poll_policy = session_sched_poll_policy,
-	}
+		.pick_next_ctx = round_robin_pick_next_ctx,
+		.poll_policy = round_robin_poll_policy,
+		.set_param = wd_sched_set_param,
+	},
 };
 
-static int wd_sched_get_nearby_numa_id(struct wd_sched_info *sched_info, int node, int numa_num)
+static int numa_num_check(__u16 region_num)
 {
-	int dis = INT32_MAX;
-	int valid_id = -1;
-	int i, tmp;
+	int max_node;
 
-	for (i = 0; i < numa_num; i++) {
-		if (sched_info[i].valid) {
-			tmp = numa_distance(node, i);
-			if (dis > tmp) {
-				valid_id = i;
-				dis = tmp;
-			}
-		}
+	max_node = numa_max_node() + 1;
+	if (max_node <= 0) {
+		WD_ERR("invalid: numa max node is %d!\n", max_node);
+		return -WD_EINVAL;
 	}
 
-	return valid_id;
+	if (!region_num || region_num > max_node) {
+		WD_ERR("invalid: region number is %u!\n", region_num);
+		return -WD_EINVAL;
+	}
+
+	return 0;
 }
 
-static void wd_sched_map_cpus_to_dev(struct wd_sched_ctx *sched_ctx)
-{
-	struct wd_sched_info *sched_info = sched_ctx->sched_info;
-	int i, numa_num = sched_ctx->numa_num;
-	int *numa_map = sched_ctx->numa_map;
-
-	for (i = 0; i < numa_num; i++) {
-		if (sched_info[i].valid)
-			numa_map[i] = i;
-		else
-			numa_map[i] = wd_sched_get_nearby_numa_id(sched_info, i, numa_num);
-	}
-}
-
-static int wd_instance_dev_region(struct wd_sched_ctx *sched_ctx,
-					struct sched_params *param)
-{
-	struct wd_sched_info *sched_info;
-	__u32 region_idx = INVALID_POS;
-	__u8 type, mode;
-	__u32 dev_id;
-	int i;
-
-	dev_id = param->dev_id;
-	type = param->type;
-	mode = param->mode;
-
-	/* Check whether dev_id has already been registered. */
-	for (i = 0; i < sched_ctx->dev_num; i++) {
-		if (sched_ctx->dev_id_map[i].dev_id == dev_id) {
-			region_idx = sched_ctx->dev_id_map[i].region_id;
-			break;
-		}
-	}
-
-	/* If not registered, allocate a new region. */
-	if (region_idx == INVALID_POS) {
-		if (sched_ctx->dev_num >= DEVICE_REGION_MAX) {
-			WD_ERR("too many devices registered!\n");
-			return -WD_EINVAL;
-		}
-
-		region_idx = sched_ctx->dev_num;
-		sched_ctx->dev_id_map[region_idx].dev_id = dev_id;
-		sched_ctx->dev_id_map[region_idx].region_id = region_idx;
-		sched_ctx->dev_num++;
-
-		sched_info = &sched_ctx->sched_info[region_idx];
-	} else {
-		sched_info = &sched_ctx->sched_info[region_idx];
-	}
-
-	/* Check whether the mode and type have already been registered. */
-	if (sched_info->ctx_region[mode][type].valid) {
-		WD_INFO("device %u mode %u type %u already registered\n",
-			 dev_id, mode, type);
-		return WD_SUCCESS;
-	}
-
-	/* Initialize the scheduling region for this mode and type */
-	sched_info->ctx_region[mode][type].begin = param->begin;
-	sched_info->ctx_region[mode][type].end = param->end;
-	sched_info->ctx_region[mode][type].last = param->begin;
-	sched_info->ctx_region[mode][type].valid = true;
-	sched_info->valid = true;
-
-	pthread_mutex_init(&sched_info->ctx_region[mode][type].lock, NULL);
-
-	return WD_SUCCESS;
-}
-
+/**
+ * wd_sched_rr_instance - External API for scheduling region instance
+ * @sched: Scheduler (cannot modify per API contract)
+ * @param: Scheduling parameters (cannot modify per API contract)
+ *
+ * Creates scheduling region for given parameters.
+ */
 int wd_sched_rr_instance(const struct wd_sched *sched, struct sched_params *param)
 {
-	struct wd_sched_info *sched_info = NULL;
 	struct wd_sched_ctx *sched_ctx = NULL;
-	__u8 type, mode;
-	int  numa_id;
+	struct wd_sched_ctx_domain *domain;
+	__u8 mode;
+	int ret;
 
 	if (!sched || !sched->h_sched_ctx || !param) {
 		WD_ERR("invalid: sched or sched_params is NULL!\n");
@@ -721,57 +1643,62 @@ int wd_sched_rr_instance(const struct wd_sched *sched, struct sched_params *para
 		return -WD_EINVAL;
 	}
 
-	numa_id = param->numa_id;
-	type = param->type;
 	mode = param->mode;
 	sched_ctx = (struct wd_sched_ctx *)sched->h_sched_ctx;
 
-	if (sched_ctx->numa_num > 0 && (numa_id >= sched_ctx->numa_num ||
-	    numa_id < 0)) {
-		WD_ERR("invalid: sched_ctx's numa_id is %d, numa_num is %u!\n",
-		       numa_id, sched_ctx->numa_num);
+	if (param->numa_id >= sched_ctx->region_num || param->numa_id < 0) {
+		WD_ERR("invalid: region_id is %d, region_num is %u!\n",
+		       param->numa_id, sched_ctx->region_num);
 		return -WD_EINVAL;
 	}
 
-	if (type >= sched_ctx->type_num) {
-		WD_ERR("invalid: sched_ctx's type is %u, type_num is %u!\n",
-		       type, sched_ctx->type_num);
+	if (param->type >= sched_ctx->type_num) {
+		WD_ERR("invalid: type is %u, type_num is %u!\n",
+		       param->type, sched_ctx->type_num);
 		return -WD_EINVAL;
 	}
 
 	if (mode >= SCHED_MODE_BUTT) {
-		WD_ERR("invalid: sched_ctx's mode is %u, mode_num is %d!\n",
-		       mode, SCHED_MODE_BUTT);
+		WD_ERR("invalid: mode is %u, mode_num is %u!\n",
+		       mode, sched_ctx->mode_num);
 		return -WD_EINVAL;
 	}
 
-	if (sched_ctx->policy == SCHED_POLICY_DEV)
-		return wd_instance_dev_region(sched_ctx, param);
+	if (param->ctx_prop < 0 || param->ctx_prop > UADK_ALG_SOFT)
+		param->ctx_prop = UADK_ALG_HW;
 
-	sched_info = &sched_ctx->sched_info[numa_id];
-	if (!sched_info->ctx_region[mode]) {
-		WD_ERR("invalid: ctx_region is NULL, numa: %d, mode: %u!\n",
-		       numa_id, mode);
-		return -WD_EINVAL;
+	/* Insert or get domain from hash table using four dimensions */
+	domain = wd_sched_hash_table_insert(sched_ctx->domain_hash_table,
+	                                    param->numa_id, mode, param->type,
+	                                    param->ctx_prop);
+	if (!domain)
+		return -WD_ENOMEM;
+
+	/* Add context range as new segment */
+	ret = wd_sched_domain_add_segment(domain, param->begin, param->end);
+	if (ret) {
+		WD_ERR("failed to add segment to domain!\n");
+		return ret;
 	}
+	domain->valid = true;
 
-	sched_info->ctx_region[mode][type].begin = param->begin;
-	sched_info->ctx_region[mode][type].end = param->end;
-	sched_info->ctx_region[mode][type].last = param->begin;
-	sched_info->ctx_region[mode][type].valid = true;
-	sched_info->valid = true;
-
-	wd_sched_map_cpus_to_dev(sched_ctx);
-	pthread_mutex_init(&sched_info->ctx_region[mode][type].lock, NULL);
+	WD_ERR("instance: region=%d, mode=%u, type=%u, prop=%d, begin=%u, end=%u\n",
+		param->numa_id, mode, param->type, param->ctx_prop,
+		param->begin, param->end);
 
 	return WD_SUCCESS;
 }
 
+/**
+ * wd_sched_rr_release - External API for scheduler release
+ * @sched: Scheduler to release (cannot modify per API contract)
+ *
+ * Releases all scheduler resources.
+ */
 void wd_sched_rr_release(struct wd_sched *sched)
 {
-	struct wd_sched_info *sched_info;
 	struct wd_sched_ctx *sched_ctx;
-	int i, j, region_num;
+	__u32 i;
 
 	if (!sched)
 		return;
@@ -780,59 +1707,47 @@ void wd_sched_rr_release(struct wd_sched *sched)
 	if (!sched_ctx)
 		goto ctx_out;
 
-	/* In SCHED_POLICY_DEV mode, numa_num mean device numbers */
-	if (sched_ctx->policy == SCHED_POLICY_DEV)
-		region_num = DEVICE_REGION_MAX;
-	else
-		region_num = sched_ctx->numa_num;
-
-	sched_info = sched_ctx->sched_info;
-	if (!sched_info)
-		goto info_out;
-
-	for (i = 0; i < region_num; i++) {
-		for (j = 0; j < SCHED_MODE_BUTT; j++) {
-			if (sched_info[i].ctx_region[j]) {
-				free(sched_info[i].ctx_region[j]);
-				sched_info[i].ctx_region[j] = NULL;
-			}
+	/* Release all session keys */
+	for (i = 0; i < sched_ctx->skey_num; i++) {
+		if (sched_ctx->skey[i] != NULL) {
+			wd_sched_skey_domain_destroy(&sched_ctx->skey[i]->sync_domain);
+			wd_sched_skey_domain_destroy(&sched_ctx->skey[i]->async_domain);
 		}
+		sched_ctx->skey[i] = NULL;
+	}
+	sched_ctx->skey_num = 0;
+
+	/* Release hash table */
+	if (sched_ctx->domain_hash_table) {
+		wd_sched_hash_table_destroy(sched_ctx->domain_hash_table);
+		sched_ctx->domain_hash_table = NULL;
 	}
 
-info_out:
+	pthread_mutex_destroy(&sched_ctx->skey_lock);
 	free(sched_ctx);
+
 ctx_out:
 	free(sched);
-
 	return;
 }
 
-static int numa_num_check(__u16 numa_num)
-{
-	int max_node;
-
-	max_node = numa_max_node() + 1;
-	if (max_node <= 0) {
-		WD_ERR("invalid: numa max node is %d!\n", max_node);
-		return -WD_EINVAL;
-	}
-
-	if (!numa_num || numa_num > max_node) {
-		WD_ERR("invalid: numa number is %u!\n", numa_num);
-		return -WD_EINVAL;
-	}
-
-	return 0;
-}
-
+/**
+ * wd_sched_rr_alloc - External API for scheduler allocation
+ * @sched_type: Scheduling policy type (cannot modify per API contract)
+ * @type_num: Number of operation types (cannot modify per API contract)
+ * @region_num: Number of regions (cannot modify per API contract)
+ * @func: Poll function (cannot modify per API contract)
+ *
+ * Allocates and initializes scheduler with single global hash table.
+ */
 struct wd_sched *wd_sched_rr_alloc(__u8 sched_type, __u8 type_num,
-				   __u16 numa_num, user_poll_func func)
+				   __u16 region_num, user_poll_func func)
 {
-	struct wd_sched_info *sched_info;
 	struct wd_sched_ctx *sched_ctx;
 	struct wd_sched *sched;
-	int region_num;
-	int i, j;
+	__u32 estimated_entries;
+	__u32 i;
+	int ret;
 
 	if (sched_type >= SCHED_POLICY_BUTT || !type_num) {
 		WD_ERR("invalid: sched_type is %u or type_num is %u!\n",
@@ -846,63 +1761,72 @@ struct wd_sched *wd_sched_rr_alloc(__u8 sched_type, __u8 type_num,
 		return NULL;
 	}
 
-	if (sched_type == SCHED_POLICY_DEV)
-		region_num = DEVICE_REGION_MAX;
-	else
-		region_num = numa_num;
-
-	sched_ctx = calloc(1, sizeof(struct wd_sched_ctx) +
-			   sizeof(struct wd_sched_info) * region_num);
+	sched_ctx = calloc(1, sizeof(struct wd_sched_ctx));
 	if (!sched_ctx) {
 		WD_ERR("failed to alloc memory for sched_ctx!\n");
 		goto err_out;
 	}
 
-	/* In SCHED_POLICY_DEV mode, numa_num mean device numbers */
-	if (sched_type == SCHED_POLICY_DEV) {
-		sched_ctx->numa_num = 0;
-		sched_ctx->dev_num = 0;
-		for (i = 0; i < DEVICE_REGION_MAX; i++) {
-			sched_ctx->dev_id_map[i].dev_id = INVALID_POS;
-			sched_ctx->dev_id_map[i].region_id = INVALID_POS;
-		}
-	} else {
-		sched_ctx->numa_num = numa_num;
-		sched_ctx->dev_num = 0;
-		if (numa_num_check(sched_ctx->numa_num))
-			goto err_out;
+	/* Cache dimension parameters */
+	sched_ctx->type_num = type_num;
+	sched_ctx->mode_num = SCHED_MODE_BUTT;
+	sched_ctx->region_num = region_num;
+	sched_ctx->policy = sched_type;
+
+	if (sched_type == SCHED_POLICY_NONE || sched_type == SCHED_POLICY_SINGLE) {
+		/* Simple schedulers don't need hash table */
+		goto simple_ok;
 	}
 
-	sched->h_sched_ctx = (handle_t)sched_ctx;
-	if (sched_type == SCHED_POLICY_NONE ||
-	    sched_type == SCHED_POLICY_SINGLE)
-		goto simple_ok;
+	if (sched_type == SCHED_POLICY_DEV) {
+		/* Device mode: region_num is actually device count */
+		estimated_entries = region_num * type_num * SCHED_MODE_BUTT * UADK_ALG_TYPE_MAX;
+	} else {
+		/* NUMA mode: validate region_num */
+		if (numa_num_check(region_num))
+			goto err_out;
+		estimated_entries = region_num * type_num * SCHED_MODE_BUTT * UADK_ALG_TYPE_MAX;
+	}
 
-	sched_info = sched_ctx->sched_info;
-	for (i = 0; i < region_num; i++) {
-		for (j = 0; j < SCHED_MODE_BUTT; j++) {
-			sched_info[i].ctx_region[j] =
-			calloc(1, sizeof(struct sched_ctx_region) * type_num);
-			if (!sched_info[i].ctx_region[j])
-				goto err_out;
-		}
+	/* Create single global hash table */
+	sched_ctx->domain_hash_table = wd_sched_hash_table_create(estimated_entries);
+	if (!sched_ctx->domain_hash_table) {
+		WD_ERR("failed to create hash table!\n");
+		goto ctx_out;
 	}
 
 simple_ok:
 	sched_ctx->poll_func = func;
-	sched_ctx->policy = sched_type;
-	sched_ctx->type_num = type_num;
-	memset(sched_ctx->numa_map, -1, sizeof(int) * NUMA_NUM_NODES);
 
+	for (i = 0; i < SKEY_MAX_THREAD_NUM; i++) {
+		sched_ctx->skey[i] = NULL;
+		sched_ctx->poll_tid[i] = 0;
+	}
+	ret = pthread_mutex_init(&sched_ctx->skey_lock, NULL);
+	if (ret) {
+		WD_ERR("failed to init skey_lock: %d\n", ret);
+		free(sched_ctx);
+		free(sched);
+		return NULL;
+	}
+	sched_ctx->skey_num = 0;
+
+	sched->h_sched_ctx = (handle_t)sched_ctx;
 	sched->sched_init = sched_table[sched_type].sched_init;
 	sched->pick_next_ctx = sched_table[sched_type].pick_next_ctx;
 	sched->poll_policy = sched_table[sched_type].poll_policy;
 	sched->sched_policy = sched_type;
 	sched->name = sched_table[sched_type].name;
+	sched->set_param = sched_table[sched_type].set_param;
+
+	WD_INFO("Scheduler %s allocated: type_num=%u, region_num=%u, mode_num=%d\n",
+		sched->name, type_num, region_num, SCHED_MODE_BUTT);
 
 	return sched;
 
+ctx_out:
+	free(sched_ctx);
 err_out:
-	wd_sched_rr_release(sched);
+	free(sched);
 	return NULL;
 }

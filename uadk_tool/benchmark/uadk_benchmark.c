@@ -7,14 +7,6 @@
 
 #include "uadk_benchmark.h"
 #include "sec_uadk_benchmark.h"
-#include "sec_wd_benchmark.h"
-#include "sec_soft_benchmark.h"
-
-#include "hpre_uadk_benchmark.h"
-#include "hpre_wd_benchmark.h"
-
-#include "zip_uadk_benchmark.h"
-#include "zip_wd_benchmark.h"
 
 #define TABLE_SPACE_SIZE	8
 
@@ -267,6 +259,30 @@ static int get_mode_type(const char *mode_name)
 	return modetype;
 }
 
+struct sched_policy_item {
+	char *name;
+	u32 policy;
+};
+
+static struct sched_policy_item sched_policy_names[] = {
+	{"rr",     SCHED_POLICY_RR},
+	{"loop",   SCHED_POLICY_LOOP},
+	{"hungry", SCHED_POLICY_HUNGRY},
+	{"instr",  SCHED_POLICY_INSTR},
+};
+
+static u32 get_sched_policy_type(const char *name)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(sched_policy_names); i++) {
+		if (strcmp(name, sched_policy_names[i].name) == 0)
+			return sched_policy_names[i].policy;
+	}
+
+	return SCHED_POLICY_BUTT;
+}
+
 int get_pid_cpu_time(u32 *ptime)
 {
 	u64 caltime[8] = {0};
@@ -359,7 +375,7 @@ void get_rand_data(u8 *addr, u32 size)
 	}
 
 	for (i = 0; i < num_u64; i++) {
-		/* Use nrand48£¬it will auto update rand_state */
+		/* Use nrand48ï¿½ï¿½it will auto update rand_state */
 		rand48_result = nrand48(rand_state);
 		 *((u64 *)addr + i) = rand48_result;
 	}
@@ -493,9 +509,10 @@ static void parse_alg_param(struct acc_option *option)
 			option->subtype = DIGEST_TYPE;
 			option->acctype = SEC_TYPE;
 			if (option->modetype == INSTR_MODE) {
-				option->sched_type = SCHED_POLICY_NONE;
+				option->subtype = DIGEST_INSTR_TYPE;
 				option->task_type = TASK_INSTR;
 			} else if (option->modetype == MULTIBUF_MODE) {
+				option->subtype = DIGEST_INSTR_TYPE;
 				option->sched_type = SCHED_POLICY_SINGLE;
 				option->task_type = TASK_INSTR;
 			}
@@ -564,28 +581,6 @@ static int benchmark_run(struct acc_option *option)
 		    (option->modetype == INSTR_MODE) ||
 		    (option->modetype == MULTIBUF_MODE)) {
 			ret = sec_uadk_benchmark(option);
-		} else if (option->modetype == NOSVA_MODE) {
-			ret = sec_wd_benchmark(option);
-		}
-		usleep(20000);
-#ifdef HAVE_CRYPTO
-		if (option->modetype == SOFT_MODE) {
-			ret = sec_soft_benchmark(option);
-		}
-#endif
-		break;
-	case HPRE_TYPE:
-		if (option->modetype == SVA_MODE) {
-			ret = hpre_uadk_benchmark(option);
-		} else if (option->modetype == NOSVA_MODE) {
-			ret = hpre_wd_benchmark(option);
-		}
-		break;
-	case ZIP_TYPE:
-		if (option->modetype == SVA_MODE) {
-			ret = zip_uadk_benchmark(option);
-		} else if (option->modetype == NOSVA_MODE) {
-			ret = zip_wd_benchmark(option);
 		}
 		break;
 	}
@@ -611,6 +606,8 @@ static void dump_param(struct acc_option *option)
 	ACC_TST_PRT("    [--latency]: %u\n", option->latency);
 	ACC_TST_PRT("    [--init2]:   %u\n", option->inittype);
 	ACC_TST_PRT("    [--device]:  %s\n", option->device);
+	ACC_TST_PRT("    [--sched_type]: %u\n", option->sched_type);
+	ACC_TST_PRT("    [--task_type]:  %d\n", option->task_type);
 }
 
 int acc_benchmark_run(struct acc_option *option)
@@ -620,8 +617,10 @@ int acc_benchmark_run(struct acc_option *option)
 	int i, ret = 0;
 	int status;
 
-	option->sched_type = SCHED_POLICY_RR;
-	option->task_type = TASK_HW;
+	if (!option->sched_override) {
+		option->sched_type = SCHED_POLICY_HUNGRY;
+		option->task_type = TASK_HW;
+	}
 	parse_alg_param(option);
 	dump_param(option);
 	g_run_options = option;
@@ -739,6 +738,8 @@ void print_benchmark_help(void)
 	ACC_TST_PRT("        select init2 mode in the init interface of UADK SVA\n");
 	ACC_TST_PRT("    [--device]:\n");
 	ACC_TST_PRT("        select device to do task\n");
+	ACC_TST_PRT("    [--policy rr/loop/hungry/instr]:\n");
+	ACC_TST_PRT("        select scheduling policy (default: hungry for --init2, rr otherwise)\n");
 	ACC_TST_PRT("    [--help]  = usage\n");
 	ACC_TST_PRT("Example\n");
 	ACC_TST_PRT("    ./uadk_tool benchmark --alg aes-128-cbc --mode sva --opt 0 --sync\n");
@@ -783,6 +784,7 @@ int acc_cmd_parse(int argc, char *argv[], struct acc_option *option)
 		{"device",	required_argument,	0, 18},
 		{"memory",	required_argument,	0, 19},
 		{"sgl",		no_argument,		0, 20},
+		{"policy",	required_argument,	0, 21},
 		{0, 0, 0, 0}
 	};
 
@@ -859,6 +861,14 @@ int acc_cmd_parse(int argc, char *argv[], struct acc_option *option)
 			break;
 		case 20:
 			option->data_fmt = WD_SGL_BUF;
+			break;
+		case 21:
+			option->sched_type = get_sched_policy_type(optarg);
+			if (option->sched_type == SCHED_POLICY_BUTT) {
+				ACC_TST_PRT("invalid: unknown policy '%s', use rr/loop/hungry/instr\n", optarg);
+				goto to_exit;
+			}
+			option->sched_override = true;
 			break;
 		default:
 			ACC_TST_PRT("invalid: bad input parameter!\n");
