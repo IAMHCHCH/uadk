@@ -187,7 +187,7 @@ struct wd_sched_key_domain {
 	struct wd_sched_domain_idx_cache idx_cache;
 	pthread_mutex_t lock;
 	__u32 expanded_count;
-	atomic_t pending_count;	/* Pending request count for poll optimization */
+	atomic_int pending_count;	/* Pending request count for poll optimization */
 };
 
 /**
@@ -542,7 +542,7 @@ static int wd_sched_domain_add_segment(struct wd_sched_ctx_domain *domain,
 	/* Initialize polling state */
 	if (!domain->current_segment) {
 		domain->current_segment = domain->segments;
-		domain->current_pos = domain->segments->begin;
+		domain->current_pos = 0;
 	}
 
 	pthread_mutex_unlock(&domain->lock);
@@ -573,9 +573,12 @@ static __u32 wd_sched_domain_get_next_rr(struct wd_sched_ctx_domain *domain)
 		domain->current_segment = domain->segments;
 
 	/* Reset current_pos if it fell outside the current segment */
-	if (domain->current_pos < domain->current_segment->begin ||
-	    domain->current_pos > domain->current_segment->end)
-		domain->current_pos = domain->current_segment->begin;
+	{
+		__u32 seg_len = domain->current_segment->end
+			- domain->current_segment->begin + 1;
+		if (domain->current_pos >= seg_len)
+			domain->current_pos = 0;
+	}
 
 	pos = domain->current_pos;
 
@@ -787,13 +790,15 @@ static int wd_sched_skey_remove_ctx(struct wd_sched_domain_idx_cache *cache,
 	/* Shift remaining elements to fill the gap */
 	for (; i < cache->valid_count - 1; i++) {
 		cache->idx_list[i] = cache->idx_list[i + 1];
-		atomic_store(&cache->load_values[i], 
+		atomic_store(&cache->load_values[i],
 		atomic_load(&cache->load_values[i + 1]));
+		cache->ctx_props[i] = cache->ctx_props[i + 1];
 	}
 
 	/* Clear last position */
 	cache->idx_list[cache->valid_count - 1] = INVALID_POS;
 	atomic_store(&cache->load_values[cache->valid_count - 1], 0);
+	cache->ctx_props[cache->valid_count - 1] = 0;
 	cache->valid_count--;
 
 	/* Reset pointers if cache becomes empty */
@@ -951,6 +956,7 @@ static int wd_sched_skey_domain_init(struct wd_sched_key_domain *key_domain,
 	}
 
 	key_domain->expanded_count = 0;
+	atomic_store(&key_domain->pending_count, 0);
 
 	return 0;
 
@@ -1099,25 +1105,33 @@ static int wd_sched_poll_skey(struct wd_sched_ctx *sched_ctx, struct wd_sched_ke
 	__u32 idx, i;
 	int ret;
 
-	/* Poll async domain contexts */
+	/* Poll async domain contexts (lock to protect against concurrent add/remove) */
+	pthread_mutex_lock(&skey->async_domain.idx_cache.cache_lock);
 	for (i = 0; i < skey->async_domain.idx_cache.valid_count; i++) {
 		idx = skey->async_domain.idx_cache.idx_list[i];
 
 		poll_num = 0;
 		ret = sched_ctx->poll_func(idx, expect, &poll_num);
-		if ((ret < 0) && (ret != -EAGAIN))
+		if ((ret < 0) && (ret != -EAGAIN)) {
+			pthread_mutex_unlock(&skey->async_domain.idx_cache.cache_lock);
 			return ret;
+		}
 
 		if (poll_num > 0) {
 			sum_poll_num += poll_num;
 			/* Decrement pending count for successfully polled requests */
-			atomic_fetch_sub(&skey->async_domain.pending_count, poll_num);
+			int pending = atomic_load(&skey->async_domain.pending_count);
+			if (pending >= (int)poll_num)
+				atomic_fetch_sub(&skey->async_domain.pending_count, poll_num);
+			else
+				atomic_store(&skey->async_domain.pending_count, 0);
 		}
 
 		/* Update load value for this context */
 		if (skey->async_domain.idx_cache.policy == SCHED_POLICY_HUNGRY)
 			wd_sched_skey_update_load(&skey->async_domain.idx_cache, i, -poll_num);
 	}
+	pthread_mutex_unlock(&skey->async_domain.idx_cache.cache_lock);
 	*count = sum_poll_num;
 
 	return 0;
@@ -1193,6 +1207,9 @@ static struct wd_sched_key *sched_get_poll_skey(struct wd_sched_ctx *sched_ctx)
 	__u16 tpos, start_pos;
 	__u16 i, tidx = 0;
 
+	if (unlikely(!ctx_num))
+		return NULL;
+
 	/* Randomize the initial query position. */
 	start_pos = tid % ctx_num;
 
@@ -1217,6 +1234,38 @@ static struct wd_sched_key *sched_get_poll_skey(struct wd_sched_ctx *sched_ctx)
 	}
 
 	return sched_ctx->skey[tidx];
+}
+
+/**
+ * session_sched_init_ctx_prop - Same as session_sched_init_ctx but with explicit prop
+ * @prop: Context property (HW/CE/SVE/SOFT) to use for hash table lookup
+ *
+ * Thread-safe: does not read or modify skey->ctx_prop.
+ */
+static __u32 session_sched_init_ctx_prop(struct wd_sched_ctx *sched_ctx,
+	struct wd_sched_key *skey, const int sched_mode, __u8 prop)
+{
+	struct wd_sched_ctx_domain *domain = NULL;
+
+	if (!skey)
+		return INVALID_POS;
+
+	if (skey->region_id >= sched_ctx->region_num || sched_mode >= SCHED_MODE_BUTT ||
+	     skey->type >= sched_ctx->type_num || prop >= UADK_ALG_TYPE_MAX) {
+		WD_ERR("invalid: region: %d, mode: %d, type: %u!, prop: %u\n",
+		       skey->region_id, sched_mode, skey->type, prop);
+		return INVALID_POS;
+	}
+
+	if (!sched_ctx->domain_hash_table)
+		return INVALID_POS;
+
+	domain = wd_sched_hash_table_lookup(sched_ctx->domain_hash_table,
+					      skey->region_id, sched_mode, skey->type, prop);
+	if (!domain || !domain->valid)
+		return INVALID_POS;
+
+	return wd_sched_domain_get_next_rr(domain);
 }
 
 /**
@@ -1542,6 +1591,8 @@ static handle_t skey_sched_init(handle_t h_sched_ctx, void *sched_param)
 	handle_t hskey;
 	int i, ret = 0;
 	__u8 def_prop;
+	bool first_prop = true;
+	__u32 sync_ctx, async_ctx;
 
 	hskey = sched_session_common_init(sched_ctx, param);
 	if (WD_IS_ERR(hskey)) {
@@ -1551,17 +1602,38 @@ static handle_t skey_sched_init(handle_t h_sched_ctx, void *sched_param)
 
 	skey = (struct wd_sched_key *)hskey;
 	def_prop = skey->ctx_prop;
-	/* Init and get ctx for every ctx mode */
+	/* Accumulate ctxs from all available props (HW → CE → SVE → SOFT) */
 	for (i = 0; i < UADK_ALG_TYPE_MAX; i++) {
 		skey->ctx_prop = i;
-		ret = session_sched_domain_init(sched_ctx, skey);
-		if (ret != 0)
-			continue;
 
-		/* Request two Pre_fetch queues each time. */
+		if (first_prop) {
+			ret = session_sched_domain_init(sched_ctx, skey);
+			if (ret != 0)
+				continue;
+			first_prop = false;
+			req_ctx_num += 2;
+		} else {
+			sync_ctx = session_sched_init_ctx(sched_ctx, skey,
+				SCHED_MODE_SYNC);
+			async_ctx = session_sched_init_ctx(sched_ctx, skey,
+				SCHED_MODE_ASYNC);
+
+			if (sync_ctx == INVALID_POS && async_ctx == INVALID_POS)
+				continue;
+
+			if (sync_ctx != INVALID_POS) {
+				if (wd_sched_skey_add_ctx(&skey->sync_domain.idx_cache,
+					sync_ctx, i) == 0)
+					req_ctx_num++;
+			}
+			if (async_ctx != INVALID_POS) {
+				if (wd_sched_skey_add_ctx(&skey->async_domain.idx_cache,
+					async_ctx, i) == 0)
+					req_ctx_num++;
+			}
+		}
+
 		WD_INFO("Successful to request prop=%d type ctx!\n", i);
-		req_ctx_num += 2;
-			break;
 	}
 	if (!req_ctx_num) {
 		free(skey);
@@ -1610,28 +1682,58 @@ static __u32 skey_sched_pick_next_ctx(handle_t h_sched_ctx, void *sched_key,
 	if (min_ctx == INVALID_POS)
 		return INVALID_POS;
 
-	/* If the queue with the lightest load is already fully loaded, then tasks cannot be dispatched. */
+	/* If the queue with the lightest load is already fully loaded,
+	 * scan all cached ctxs for an available one with lower load.
+	 * Prefer higher-priority props (HW > CE > SVE > SOFT).
+	 */
 	min_load = domain->idx_cache.load_values[ctx_idx];
-	if (min_load >= HW_CTX_FULL_DEPTH)
-		return INVALID_POS;
+	if (min_load >= HW_CTX_FULL_DEPTH) {
+		struct wd_sched_domain_idx_cache *cache = &domain->idx_cache;
+		__u32 best_i = INVALID_POS;
+		__u32 best_load = HW_CTX_FULL_DEPTH;
+		__u8 best_prop = UADK_CTX_MAX;
+		__u32 i;
+
+		for (i = 0; i < cache->valid_count; i++) {
+			__u32 load = atomic_load(&cache->load_values[i]);
+			__u8 prop = cache->ctx_props[i];
+			if (load < best_load ||
+			    (load == best_load && prop < best_prop)) {
+				best_i = i;
+				best_load = load;
+				best_prop = prop;
+			}
+		}
+
+		if (best_i != INVALID_POS && best_load < HW_CTX_FULL_DEPTH) {
+			ctx_idx = best_i;
+			min_ctx = cache->idx_list[best_i];
+			min_load = best_load;
+		} else {
+			return INVALID_POS;
+		}
+	}
 
 	/* Update load value for send one task */
 	wd_sched_skey_update_load(&domain->idx_cache, ctx_idx, 1);
 	/* Check if we need to expand context pool */
-	if (min_load > HUNGRY_LOAD_THRESHOLD) {
-		/* Ceiling check: don't expand beyond SKEY_CTX_MAX_NUM */
-		if (domain->idx_cache.valid_count >= SKEY_CTX_MAX_NUM)
-			goto skip_expand;
-		/* Try to allocate new context from domain */
-		new_ctx = session_sched_init_ctx(sched_ctx, skey, sched_mode);
-		if (new_ctx != INVALID_POS) {
-			if (wd_sched_skey_add_ctx(&domain->idx_cache, new_ctx, skey->ctx_prop) == 0) {
-				domain->expanded_count++;
-				min_ctx = new_ctx;
+	if (min_load > HUNGRY_LOAD_THRESHOLD
+	    && domain->idx_cache.valid_count < SKEY_CTX_MAX_NUM) {
+		/* Try all props in priority order for expansion */
+		int p;
+		for (p = 0; p < UADK_ALG_TYPE_MAX; p++) {
+			new_ctx = session_sched_init_ctx_prop(sched_ctx,
+				skey, sched_mode, p);
+			if (new_ctx != INVALID_POS) {
+				if (wd_sched_skey_add_ctx(&domain->idx_cache,
+					new_ctx, p) == 0) {
+					domain->expanded_count++;
+					min_ctx = new_ctx;
+					break;
+				}
 			}
 		}
 	}
-skip_expand:
 
 	return min_ctx;
 }
@@ -1682,6 +1784,8 @@ static handle_t loop_sched_init(handle_t h_sched_ctx, void *sched_param)
 	handle_t hskey;
 	int i, ret = 0;
 	__u8 def_prop;
+	bool first_prop = true;
+	__u32 sync_ctx, async_ctx;
 
 	hskey = sched_session_common_init(sched_ctx, param);
 	if (WD_IS_ERR(hskey)) {
@@ -1691,17 +1795,38 @@ static handle_t loop_sched_init(handle_t h_sched_ctx, void *sched_param)
 
 	skey = (struct wd_sched_key *)hskey;
 	def_prop = skey->ctx_prop;
-	/* Init and get ctx for every ctx mode */
+	/* Accumulate ctxs from all available props (HW → CE → SVE → SOFT) */
 	for (i = 0; i < UADK_ALG_TYPE_MAX; i++) {
 		skey->ctx_prop = i;
-		ret = session_sched_domain_init(sched_ctx, skey);
-		if (ret != 0)
-			continue;
 
-		/* Request two Pre_fetch queues each time. */
+		if (first_prop) {
+			ret = session_sched_domain_init(sched_ctx, skey);
+			if (ret != 0)
+				continue;
+			first_prop = false;
+			req_ctx_num += 2;
+		} else {
+			sync_ctx = session_sched_init_ctx(sched_ctx, skey,
+				SCHED_MODE_SYNC);
+			async_ctx = session_sched_init_ctx(sched_ctx, skey,
+				SCHED_MODE_ASYNC);
+
+			if (sync_ctx == INVALID_POS && async_ctx == INVALID_POS)
+				continue;
+
+			if (sync_ctx != INVALID_POS) {
+				if (wd_sched_skey_add_ctx(&skey->sync_domain.idx_cache,
+					sync_ctx, i) == 0)
+					req_ctx_num++;
+			}
+			if (async_ctx != INVALID_POS) {
+				if (wd_sched_skey_add_ctx(&skey->async_domain.idx_cache,
+					async_ctx, i) == 0)
+					req_ctx_num++;
+			}
+		}
+
 		WD_INFO("Successful to request prop=%d type ctx!\n", i);
-		req_ctx_num += 2;
-			break;
 	}
 	if (!req_ctx_num) {
 		free(skey);
@@ -1710,7 +1835,7 @@ static handle_t loop_sched_init(handle_t h_sched_ctx, void *sched_param)
 
 	/* Restore the initialization prop settings. */
 	skey->ctx_prop = def_prop;
-	sched_skey_param_init(sched_ctx, skey);	
+	sched_skey_param_init(sched_ctx, skey);
 	WD_INFO("initialized Loop scheduler with sync and async domains\n");
 	return (handle_t)skey;
 }
@@ -1742,11 +1867,17 @@ static __u32 loop_sched_pick_next_ctx(handle_t h_sched_ctx, void *sched_key,
 	if (cache->valid_count == 0)
 		return INVALID_POS;
 
-	/* Global RR across all ctx, track per-prop stats */
+	/* Global RR across all ctx with load-aware overflow:
+	 * skip ctxs at full depth; try next RR position.
+	 * Multi-prop ctxs from lower-priority props act as overflow.
+	 */
 	do {
 		pos = atomic_fetch_add(&cache->rr_ptr, 1) % cache->valid_count;
 		ctx_id = cache->idx_list[pos];
 		if (ctx_id != INVALID_POS) {
+			/* Skip ctxs that are fully loaded */
+			if (atomic_load(&cache->load_values[pos]) >= HW_CTX_FULL_DEPTH)
+				continue;
 			/* Update per-prop RR counter and pick stats for tracking */
 			atomic_fetch_add(&cache->prop_ptrs[cache->ctx_props[pos]], 1);
 			atomic_fetch_add(&cache->pick_counts[cache->ctx_props[pos]], 1);
@@ -2118,6 +2249,7 @@ void wd_sched_rr_release(struct wd_sched *sched)
 		sched_ctx->domain_hash_table = NULL;
 	}
 
+	pthread_mutex_destroy(&sched_ctx->skey_lock);
 	free(sched_ctx);
 
 ctx_out:
@@ -2141,6 +2273,7 @@ struct wd_sched *wd_sched_rr_alloc(__u8 sched_type, __u8 type_num,
 	struct wd_sched *sched;
 	__u32 estimated_entries;
 	__u32 i;
+	int ret;
 
 	if (sched_type >= SCHED_POLICY_BUTT || !type_num) {
 		WD_ERR("invalid: sched_type is %u or type_num is %u!\n",
@@ -2195,7 +2328,13 @@ simple_ok:
 		sched_ctx->skey[i] = NULL;
 		sched_ctx->poll_tid[i] = 0;
 	}
-	pthread_mutex_init(&sched_ctx->skey_lock, NULL);
+	ret = pthread_mutex_init(&sched_ctx->skey_lock, NULL);
+	if (ret) {
+		WD_ERR("failed to init skey_lock: %d\n", ret);
+		free(sched_ctx);
+		free(sched);
+		return NULL;
+	}
 	sched_ctx->skey_num = 0;
 
 	sched->h_sched_ctx = (handle_t)sched_ctx;
