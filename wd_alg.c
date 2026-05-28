@@ -325,8 +325,10 @@ int wd_alg_driver_register(struct wd_alg_driver *drv)
 			return -WD_ENOMEM;
 		}
 
-		strncpy(target_node->drv_name, drv->drv_name, DEV_NAME_LEN - 1);
-		strncpy(target_node->alg_type, alg_type, ALG_NAME_SIZE - 1);
+		memcpy(target_node->drv_name, drv->drv_name, DEV_NAME_LEN);
+	target_node->drv_name[DEV_NAME_LEN - 1] = '\0';
+		memcpy(target_node->alg_type, alg_type, ALG_NAME_SIZE);
+	target_node->alg_type[ALG_NAME_SIZE - 1] = '\0';
 		target_node->priority = drv->priority;
 		target_node->calc_type = drv->calc_type;
 		target_node->drv = drv;

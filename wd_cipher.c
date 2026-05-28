@@ -351,7 +351,6 @@ static void wd_cipher_clear_status(void)
 static int wd_cipher_common_init(struct wd_ctx_config *config,
 				 struct wd_sched *sched, void *attrs)
 {
-	struct wd_init_attrs *cipher_attrs = (struct wd_init_attrs *)attrs;
 	int ret;
 
 	ret = wd_set_epoll_en("WD_CIPHER_EPOLL_EN",
