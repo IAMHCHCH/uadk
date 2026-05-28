@@ -300,10 +300,14 @@ static int session_init(struct bench_config *cfg, struct async_ctx *ctx)
 
 	ctx->src = mmap(NULL, cfg->pkt_size, PROT_READ | PROT_WRITE,
 			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (ctx->src == MAP_FAILED)
+		return -ENOMEM;
 	ctx->dst = mmap(NULL, cfg->pkt_size, PROT_READ | PROT_WRITE,
 			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (ctx->src == MAP_FAILED || ctx->dst == MAP_FAILED)
+	if (ctx->dst == MAP_FAILED) {
+		munmap(ctx->src, cfg->pkt_size);
 		return -ENOMEM;
+	}
 
 	memset(ctx->src, 0xCC, cfg->pkt_size);
 	memset(ctx->dst, 0, cfg->pkt_size);
@@ -415,6 +419,9 @@ static void async_run_bench(struct bench_config *cfg, struct async_ctx *ctx,
 			usleep(1000);
 			do { wd_cipher_poll(64, &_c); } while(0);
 		}
+		if (drain_timeout <= 0)
+			fprintf(stderr, "WARN: drain timeout, %llu ops may be abandoned\n",
+				total_sent - __sync_fetch_and_add(&ctx->completed, 0));
 	}
 
 	st->elapsed_sec       = elapsed_sec_since(&start);
@@ -511,6 +518,8 @@ static int run_multi_threaded(struct bench_config *cfg)
 		ret = pthread_create(&tids[i], NULL, thread_worker, cfg);
 		if (ret) {
 			fprintf(stderr, "FAIL: pthread_create thread=%d err=%d\n", i, ret);
+			for (int j = 0; j < i; j++)
+				pthread_join(tids[j], NULL);
 			return -1;
 		}
 	}
@@ -647,13 +656,17 @@ int main(int argc, char **argv)
 		case 'p':
 			cfg.pkt_size = atoi(optarg);
 			if (cfg.pkt_size < 16) cfg.pkt_size = 16;
+			if (cfg.pkt_size > 1048576) cfg.pkt_size = 1048576;
 			break;
 		case 256:
 			cfg.ctx_nums = atoi(optarg);
 			if (cfg.ctx_nums < 1) cfg.ctx_nums = 1;
+			if (cfg.ctx_nums > 1024) cfg.ctx_nums = 1024;
 			break;
 		case 257:
 			cfg.ctx_msg_num = atoi(optarg);
+			if (cfg.ctx_msg_num < 1) cfg.ctx_msg_num = 1;
+			if (cfg.ctx_msg_num > LAT_RING_SIZE) cfg.ctx_msg_num = LAT_RING_SIZE;
 			break;
 		case 258:
 			cfg.show_prop_stats = true;
