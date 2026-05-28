@@ -187,7 +187,7 @@ struct wd_sched_key_domain {
 	struct wd_sched_domain_idx_cache idx_cache;
 	pthread_mutex_t lock;
 	__u32 expanded_count;
-	atomic_t pending_count;	/* Pending request count for poll optimization */
+	atomic_int pending_count;	/* Pending request count for poll optimization */
 };
 
 /**
@@ -1542,6 +1542,8 @@ static handle_t skey_sched_init(handle_t h_sched_ctx, void *sched_param)
 	handle_t hskey;
 	int i, ret = 0;
 	__u8 def_prop;
+	bool first_prop = true;
+	__u32 sync_ctx, async_ctx;
 
 	hskey = sched_session_common_init(sched_ctx, param);
 	if (WD_IS_ERR(hskey)) {
@@ -1551,17 +1553,38 @@ static handle_t skey_sched_init(handle_t h_sched_ctx, void *sched_param)
 
 	skey = (struct wd_sched_key *)hskey;
 	def_prop = skey->ctx_prop;
-	/* Init and get ctx for every ctx mode */
+	/* Accumulate ctxs from all available props (HW → CE → SVE → SOFT) */
 	for (i = 0; i < UADK_ALG_TYPE_MAX; i++) {
 		skey->ctx_prop = i;
-		ret = session_sched_domain_init(sched_ctx, skey);
-		if (ret != 0)
-			continue;
 
-		/* Request two Pre_fetch queues each time. */
+		if (first_prop) {
+			ret = session_sched_domain_init(sched_ctx, skey);
+			if (ret != 0)
+				continue;
+			first_prop = false;
+			req_ctx_num += 2;
+		} else {
+			sync_ctx = session_sched_init_ctx(sched_ctx, skey,
+				SCHED_MODE_SYNC);
+			async_ctx = session_sched_init_ctx(sched_ctx, skey,
+				SCHED_MODE_ASYNC);
+
+			if (sync_ctx == INVALID_POS && async_ctx == INVALID_POS)
+				continue;
+
+			if (sync_ctx != INVALID_POS) {
+				wd_sched_skey_add_ctx(&skey->sync_domain.idx_cache,
+					sync_ctx, i);
+				req_ctx_num++;
+			}
+			if (async_ctx != INVALID_POS) {
+				wd_sched_skey_add_ctx(&skey->async_domain.idx_cache,
+					async_ctx, i);
+				req_ctx_num++;
+			}
+		}
+
 		WD_INFO("Successful to request prop=%d type ctx!\n", i);
-		req_ctx_num += 2;
-			break;
 	}
 	if (!req_ctx_num) {
 		free(skey);
@@ -1610,10 +1633,37 @@ static __u32 skey_sched_pick_next_ctx(handle_t h_sched_ctx, void *sched_key,
 	if (min_ctx == INVALID_POS)
 		return INVALID_POS;
 
-	/* If the queue with the lightest load is already fully loaded, then tasks cannot be dispatched. */
+	/* If the queue with the lightest load is already fully loaded,
+	 * scan all cached ctxs for an available one with lower load.
+	 * Prefer higher-priority props (HW > CE > SVE > SOFT).
+	 */
 	min_load = domain->idx_cache.load_values[ctx_idx];
-	if (min_load >= HW_CTX_FULL_DEPTH)
-		return INVALID_POS;
+	if (min_load >= HW_CTX_FULL_DEPTH) {
+		struct wd_sched_domain_idx_cache *cache = &domain->idx_cache;
+		__u32 best_i = INVALID_POS;
+		__u32 best_load = HW_CTX_FULL_DEPTH;
+		__u8 best_prop = UADK_CTX_MAX;
+		__u32 i;
+
+		for (i = 0; i < cache->valid_count; i++) {
+			__u32 load = atomic_load(&cache->load_values[i]);
+			__u8 prop = cache->ctx_props[i];
+			if (load < best_load ||
+			    (load == best_load && prop < best_prop)) {
+				best_i = i;
+				best_load = load;
+				best_prop = prop;
+			}
+		}
+
+		if (best_i != INVALID_POS && best_load < HW_CTX_FULL_DEPTH) {
+			ctx_idx = best_i;
+			min_ctx = cache->idx_list[best_i];
+			min_load = best_load;
+		} else {
+			return INVALID_POS;
+		}
+	}
 
 	/* Update load value for send one task */
 	wd_sched_skey_update_load(&domain->idx_cache, ctx_idx, 1);
@@ -1622,13 +1672,24 @@ static __u32 skey_sched_pick_next_ctx(handle_t h_sched_ctx, void *sched_key,
 		/* Ceiling check: don't expand beyond SKEY_CTX_MAX_NUM */
 		if (domain->idx_cache.valid_count >= SKEY_CTX_MAX_NUM)
 			goto skip_expand;
-		/* Try to allocate new context from domain */
-		new_ctx = session_sched_init_ctx(sched_ctx, skey, sched_mode);
-		if (new_ctx != INVALID_POS) {
-			if (wd_sched_skey_add_ctx(&domain->idx_cache, new_ctx, skey->ctx_prop) == 0) {
-				domain->expanded_count++;
-				min_ctx = new_ctx;
+		/* Try all props in priority order for expansion */
+		{
+			__u8 saved_prop = skey->ctx_prop;
+			int p;
+			for (p = 0; p < UADK_ALG_TYPE_MAX; p++) {
+				skey->ctx_prop = p;
+				new_ctx = session_sched_init_ctx(sched_ctx, skey,
+					sched_mode);
+				if (new_ctx != INVALID_POS) {
+					if (wd_sched_skey_add_ctx(&domain->idx_cache,
+						new_ctx, p) == 0) {
+						domain->expanded_count++;
+						min_ctx = new_ctx;
+						break;
+					}
+				}
 			}
+			skey->ctx_prop = saved_prop;
 		}
 	}
 skip_expand:
@@ -1682,6 +1743,8 @@ static handle_t loop_sched_init(handle_t h_sched_ctx, void *sched_param)
 	handle_t hskey;
 	int i, ret = 0;
 	__u8 def_prop;
+	bool first_prop = true;
+	__u32 sync_ctx, async_ctx;
 
 	hskey = sched_session_common_init(sched_ctx, param);
 	if (WD_IS_ERR(hskey)) {
@@ -1691,17 +1754,38 @@ static handle_t loop_sched_init(handle_t h_sched_ctx, void *sched_param)
 
 	skey = (struct wd_sched_key *)hskey;
 	def_prop = skey->ctx_prop;
-	/* Init and get ctx for every ctx mode */
+	/* Accumulate ctxs from all available props (HW → CE → SVE → SOFT) */
 	for (i = 0; i < UADK_ALG_TYPE_MAX; i++) {
 		skey->ctx_prop = i;
-		ret = session_sched_domain_init(sched_ctx, skey);
-		if (ret != 0)
-			continue;
 
-		/* Request two Pre_fetch queues each time. */
+		if (first_prop) {
+			ret = session_sched_domain_init(sched_ctx, skey);
+			if (ret != 0)
+				continue;
+			first_prop = false;
+			req_ctx_num += 2;
+		} else {
+			sync_ctx = session_sched_init_ctx(sched_ctx, skey,
+				SCHED_MODE_SYNC);
+			async_ctx = session_sched_init_ctx(sched_ctx, skey,
+				SCHED_MODE_ASYNC);
+
+			if (sync_ctx == INVALID_POS && async_ctx == INVALID_POS)
+				continue;
+
+			if (sync_ctx != INVALID_POS) {
+				wd_sched_skey_add_ctx(&skey->sync_domain.idx_cache,
+					sync_ctx, i);
+				req_ctx_num++;
+			}
+			if (async_ctx != INVALID_POS) {
+				wd_sched_skey_add_ctx(&skey->async_domain.idx_cache,
+					async_ctx, i);
+				req_ctx_num++;
+			}
+		}
+
 		WD_INFO("Successful to request prop=%d type ctx!\n", i);
-		req_ctx_num += 2;
-			break;
 	}
 	if (!req_ctx_num) {
 		free(skey);
@@ -1710,7 +1794,7 @@ static handle_t loop_sched_init(handle_t h_sched_ctx, void *sched_param)
 
 	/* Restore the initialization prop settings. */
 	skey->ctx_prop = def_prop;
-	sched_skey_param_init(sched_ctx, skey);	
+	sched_skey_param_init(sched_ctx, skey);
 	WD_INFO("initialized Loop scheduler with sync and async domains\n");
 	return (handle_t)skey;
 }
@@ -1742,11 +1826,17 @@ static __u32 loop_sched_pick_next_ctx(handle_t h_sched_ctx, void *sched_key,
 	if (cache->valid_count == 0)
 		return INVALID_POS;
 
-	/* Global RR across all ctx, track per-prop stats */
+	/* Global RR across all ctx with load-aware overflow:
+	 * skip ctxs at full depth; try next RR position.
+	 * Multi-prop ctxs from lower-priority props act as overflow.
+	 */
 	do {
 		pos = atomic_fetch_add(&cache->rr_ptr, 1) % cache->valid_count;
 		ctx_id = cache->idx_list[pos];
 		if (ctx_id != INVALID_POS) {
+			/* Skip ctxs that are fully loaded */
+			if (atomic_load(&cache->load_values[pos]) >= HW_CTX_FULL_DEPTH)
+				continue;
 			/* Update per-prop RR counter and pick stats for tracking */
 			atomic_fetch_add(&cache->prop_ptrs[cache->ctx_props[pos]], 1);
 			atomic_fetch_add(&cache->pick_counts[cache->ctx_props[pos]], 1);

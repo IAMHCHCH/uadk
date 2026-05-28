@@ -52,6 +52,7 @@ struct bench_config {
 	int              ctx_nums;
 	const char      *alg_name;
 	int              ctx_msg_num;
+	bool             show_prop_stats;
 };
 
 /* ── per-thread stats ─────────────────────────────────────────────── */
@@ -573,6 +574,7 @@ static void usage(const char *prog)
 		"  -p, --pkt-size  BYTES           (default: 4096)\n"
 		"  --ctx-nums      N               (default: 16)\n"
 		"  --msg-num       N               (default: 2048)\n"
+		"  --show-prop-stats                Show per-prop distribution stats\n"
 		"  -h, --help\n",
 		prog);
 }
@@ -580,16 +582,17 @@ static void usage(const char *prog)
 int main(int argc, char **argv)
 {
 	struct bench_config cfg = {
-		.mode          = BENCH_ASYNC,
-		.init_type     = BENCH_INIT2,
-		.sched_policy  = SCHED_POLICY_RR,
-		.task_type     = TASK_HW,
-		.nthreads      = 1,
-		.duration_secs = BENCH_SECS,
-		.pkt_size      = PKT_LEN,
-		.ctx_nums      = CTX_NUMS,
-		.alg_name      = "ctr(sm4)",
-		.ctx_msg_num   = 2048,
+		.mode            = BENCH_ASYNC,
+		.init_type       = BENCH_INIT2,
+		.sched_policy    = SCHED_POLICY_RR,
+		.task_type       = TASK_HW,
+		.nthreads        = 1,
+		.duration_secs   = BENCH_SECS,
+		.pkt_size        = PKT_LEN,
+		.ctx_nums        = CTX_NUMS,
+		.alg_name        = "ctr(sm4)",
+		.ctx_msg_num     = 2048,
+		.show_prop_stats = false,
 	};
 	const char *mode_str = "async";
 	const char *init_str = "init2";
@@ -604,8 +607,9 @@ int main(int argc, char **argv)
 		{"duration", required_argument, 0, 'd'},
 		{"pkt-size", required_argument, 0, 'p'},
 		{"ctx-nums", required_argument, 0, 256},
-		{"msg-num",  required_argument, 0, 257},
-		{"help",     no_argument,       0, 'h'},
+		{"msg-num",         required_argument, 0, 257},
+		{"show-prop-stats", no_argument,       0, 258},
+		{"help",            no_argument,       0, 'h'},
 		{0, 0, 0, 0}
 	};
 	int opt;
@@ -651,6 +655,9 @@ int main(int argc, char **argv)
 		case 257:
 			cfg.ctx_msg_num = atoi(optarg);
 			break;
+		case 258:
+			cfg.show_prop_stats = true;
+			break;
 		case 'h':
 		default:
 			usage(argv[0]);
@@ -687,6 +694,8 @@ int main(int argc, char **argv)
 		run_multi_threaded(&cfg);
 	}
 
+	if (cfg.show_prop_stats)
+		fprintf(stderr, "  --- Prop distribution (from SCHED_UNINIT_STATS below) ---\n");
 	global_uninit(&cfg);
 	return 0;
 }
