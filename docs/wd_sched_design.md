@@ -1017,5 +1017,125 @@ flowchart LR
 | `wd_sched_skey_compat_filter` | 8 | 替换不兼容 ctx |
 | `wd_sched_set_param` | 8 | 设算法参数，触发 compat filter |
 | `wd_sched_poll_skey` | 6 | 轮询 skey 的 async 域 ctx |
+| `session_sched_init_ctx_prop` | M02-S02 | 按 prop 显式查找 ctx（不经过 skey->ctx_prop） |
+| `skey_sched_pick_next_ctx` | M02-S02 | HUNGRY 负载感知选择 + 动态扩展 |
+| `loop_sched_pick_next_ctx` | M02-S02 | LOOP 轮转选择 + FULL_DEPTH 跳过 |
+| `bench_sched` | M02-S01 | 多维度性能压测工具 |
+
+---
+title: "M02 — 调度框架完善"
+---
+## 第七章：多 Prop 优先级溢出机制
+
+### 7.1 背景：单 prop 的局限
+
+在 M01 架构中，每个 session 绑定到一个特定的 `ctx_prop`（HW/CE/SVE/SOFT），只能使用该 prop 对应的 domain 中的 ctx。当该 prop 的 ctx 全部满载时，session 无法利用其他 prop 的空闲资源。
+
+### 7.2 解决方案：优先级溢出链
+
+M02-S02 引入了多 prop 优先级溢出机制：
+
+- **Init 阶段**：Session 初始化时按 prop 优先级（HW → CE → SVE → SOFT）遍历所有 prop，预取每个 prop 的 sync/async ctx 加入 idx_cache
+- **Pick 阶段（HUNGRY）**：当 `min_load > HUNGRY_LOAD_THRESHOLD` 且 cache 未满时，按优先级顺序尝试所有 prop 动态扩展 ctx 池
+- **Pick 阶段（LOOP）**：轮转到 `HW_CTX_FULL_DEPTH(1023)` 满载的 ctx 时自动跳过
+- **统计追踪**：每个 idx_cache 维护 `ctx_props[]` 和 `pick_counts[]`，记录每个槽位的 prop 类型和选择次数
+
+```
+溢出链方向: HW (0x0) → CE (0x1) → SVE (0x2) → SOFT (0x3)
+```
+
+### 7.3 关键函数
+
+| 函数 | 职责 |
+|------|------|
+| `skey_sched_init` / `loop_sched_init` | 遍历所有 prop 预取 ctx，`first_prop` 标志位控制首次双域初始化 |
+| `skey_sched_pick_next_ctx` | HUNGRY 负载感知选择 + `min_load > THRESHOLD` 触发扩展 |
+| `loop_sched_pick_next_ctx` | LOOP RR 选择 + `load >= FULL_DEPTH` 跳过 |
+| `session_sched_init_ctx_prop` | 按显式 prop 参数查找 ctx（避免 `skey->ctx_prop` 数据竞争） |
+
+---
+## 第八章：生产稳定性加固
+
+### 8.1 崩溃级 Bug 修复
+
+| Bug | 位置 | 修复 |
+|-----|------|------|
+| 除零崩溃 | `sched_get_poll_skey` | `skey_num == 0` 时提前返回 NULL |
+| RR ctx_idx 双倍偏移 | `wd_sched_domain_get_next_rr` | `current_pos` 改为相对位置（0-based） |
+| ctx_prop 数据竞争 | 扩展路径 | 新增 `session_sched_init_ctx_prop()` 用局部变量替代 `skey->ctx_prop` |
+
+### 8.2 内存安全
+
+- `skey_lock` mutex 在 `wd_sched_rr_release` 时销毁
+- `ctx_props[]` 数组在 `wd_sched_skey_remove_ctx` 时同步移位
+- `pending_count` 防下溢：poll 路径在 `atomic_fetch_sub` 前检查当前值
+
+### 8.3 线程安全
+
+- `wd_sched_poll_skey` 加 `cache_lock` 保护 idx_cache 读操作，防止并发 add/remove 导致的数据不一致
+
+### 8.4 错误处理
+
+- `skey_sched_init` / `loop_sched_init` 检查 `wd_sched_skey_add_ctx` 返回值
+- `wd_sched_rr_alloc` 检查 `pthread_mutex_init` 返回值
+- `bench_sched` 参数上限验证（ctx_nums ≤ 1024, pkt_size ≤ 1MB, msg_num ≤ 4096）
+- `bench_sched` mmap 失败时释放已成功的映射
+- `bench_sched` `pthread_create` 失败时 join 已创建的线程
+- `bench_sched` drain 超时输出 WARN
+
+---
+## 第九章：多维度性能压测工具
+
+### 9.1 设计目标
+
+`bench_sched` 是一个独立的性能压测工具，覆盖调度器的全维度测试矩阵：
+
+| 维度 | 选项 |
+|------|------|
+| 模式 | SYNC / ASYNC |
+| 初始化 | init（旧 API）/ init2（新 API） |
+| 调度策略 | RR / LOOP / HUNGRY / INSTR |
+| 任务类型 | TASK_HW / TASK_MIX |
+| 线程数 | 1 / 4 / 16 / 32 |
+
+理论组合数：2 × 2 × 4 × 2 × 4 = 128（扣除 old+mix 等无效组合后约 112）
+
+### 9.2 命令行参数
+
+```
+Usage: bench_sched [options]
+  -m, --mode      sync|async      (default: async)
+  -i, --init      old|init2       (default: init2)
+  -s, --sched     rr|loop|hungry|instr (default: rr)
+  -t, --task      hw|mix          (default: hw)
+  -j, --threads   N               (default: 1)
+  -d, --duration  SECS            (default: 3)
+  -p, --pkt-size  BYTES           (default: 4096)
+  --ctx-nums      N               (default: 16)
+  --msg-num       N               (default: 2048)
+  --show-prop-stats               显示各 prop 的 ctx 选择分布
+```
+
+### 9.3 全矩阵回归
+
+使用 `scripts/bench_matrix.sh` 进行自动化全矩阵回归：
+
+```bash
+# 本地运行
+./scripts/bench_matrix.sh
+
+# 远程运行（设置 REMOTE=1）
+REMOTE=1 SERVER=root@192.168.90.141 ./scripts/bench_matrix.sh
+```
+
+脚本遍历所有维度组合，跳过无效组合（old+mix），输出 CSV 格式结果。
+
+### 9.4 输出解读
+
+每次运行输出 Kops（千次操作/秒）、延迟分布（最大/平均/最小/P50/P95）、prop 分布（各 prop 的 ctx 选择次数）。生产就绪的调度器应满足：
+
+- j=32 压力测试零崩溃
+- 多轮运行 Kops 波动 < 10%
+- HW prop 选择占比 > 80%（在 HW 资源充足的场景下）
 | `sched_get_poll_skey` | 9 | poll 线程分配 skey |
 

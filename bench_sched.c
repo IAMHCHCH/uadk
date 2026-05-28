@@ -167,26 +167,29 @@ static int global_init(struct bench_config *cfg)
 		g_old.nctxs = nctxs;
 
 		g_old.ctx_cfg.ctx_num = nctxs;
-		g_old.ctx_cfg.ctxs = calloc(nctxs, sizeof(struct wd_ctx));
-		if (!g_old.ctx_cfg.ctxs)
-			return -ENOMEM;
 
-		for (int i = 0; i < nctxs; i++) {
+		{
 			struct uacce_dev *dev = wd_get_accel_dev("cipher");
 			if (!dev) {
 				fprintf(stderr, "FAIL: old_init: wd_get_accel_dev failed\n");
 				ret = -ENODEV; goto free_ctxs;
 			}
-			if (dev->numa_id < 0) dev->numa_id = 0;
-			g_old.ctx_cfg.ctxs[i].ctx = wd_request_ctx(dev);
-			if (!g_old.ctx_cfg.ctxs[i].ctx) {
-				fprintf(stderr, "FAIL: old_init: wd_request_ctx[%d] failed\n", i);
+			g_old.ctx_cfg.ctxs = calloc(nctxs, sizeof(struct wd_ctx));
+			if (!g_old.ctx_cfg.ctxs) {
 				free(dev);
-				ret = -ENODEV; goto release_ctxs;
+				return -ENOMEM;
 			}
-			g_old.ctx_cfg.ctxs[i].op_type = (i < nctxs / 2) ? 0 : 1;
-			g_old.ctx_cfg.ctxs[i].ctx_mode = (cfg->mode == BENCH_SYNC)
-				? CTX_MODE_SYNC : CTX_MODE_ASYNC;
+			for (int i = 0; i < nctxs; i++) {
+				if (dev->numa_id < 0) dev->numa_id = 0;
+				g_old.ctx_cfg.ctxs[i].ctx = wd_request_ctx(dev);
+				if (!g_old.ctx_cfg.ctxs[i].ctx) {
+					fprintf(stderr, "FAIL: old_init: wd_request_ctx[%d] failed\n", i);
+					ret = -ENODEV; goto release_ctxs;
+				}
+				g_old.ctx_cfg.ctxs[i].op_type = (i < nctxs / 2) ? 0 : 1;
+				g_old.ctx_cfg.ctxs[i].ctx_mode = (cfg->mode == BENCH_SYNC)
+					? CTX_MODE_SYNC : CTX_MODE_ASYNC;
+			}
 			free(dev);
 		}
 
@@ -386,7 +389,6 @@ static void async_run_bench(struct bench_config *cfg, struct async_ctx *ctx,
 	gettimeofday(&start, NULL);
 
 	while (ctx->running) {
-		try_cnt = 0;
 		ctx->send_times[total_sent & (LAT_RING_SIZE - 1)] = now_us();
 		ret = wd_do_cipher_async(ctx->h_sess, &ctx->req);
 		if (ret >= 0) {
