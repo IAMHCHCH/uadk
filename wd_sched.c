@@ -538,8 +538,10 @@ static int wd_sched_domain_add_segment(struct wd_sched_ctx_domain *domain,
 	domain->total_ctx_count += (end - begin + 1);
 
 	/* Initialize polling state */
-	if (!domain->current_segment)
+	if (!domain->current_segment) {
 		domain->current_segment = domain->segments;
+		domain->current_pos = domain->segments->begin;
+	}
 
 	pthread_mutex_unlock(&domain->lock);
 
@@ -566,6 +568,11 @@ static __u32 wd_sched_domain_get_next_rr(struct wd_sched_ctx_domain *domain)
 	pthread_mutex_lock(&domain->lock);
 	if (!domain->current_segment)
 		domain->current_segment = domain->segments;
+
+	/* Reset current_pos if it fell outside the current segment */
+	if (domain->current_pos < domain->current_segment->begin ||
+	    domain->current_pos > domain->current_segment->end)
+		domain->current_pos = domain->current_segment->begin;
 
 	pos = domain->current_pos;
 	next_pos = pos + 1;
@@ -1505,6 +1512,7 @@ static handle_t skey_sched_init(handle_t h_sched_ctx, void *sched_param)
 		/* Request two Pre_fetch queues each time. */
 		WD_INFO("Successful to request prop=%d type ctx!\n", i);
 		req_ctx_num += 2;
+			break;
 	}
 	if (!req_ctx_num) {
 		free(skey);
@@ -1641,6 +1649,7 @@ static handle_t loop_sched_init(handle_t h_sched_ctx, void *sched_param)
 		/* Request two Pre_fetch queues each time. */
 		WD_INFO("Successful to request prop=%d type ctx!\n", i);
 		req_ctx_num += 2;
+			break;
 	}
 	if (!req_ctx_num) {
 		free(skey);
