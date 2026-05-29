@@ -190,3 +190,5 @@ v1/test/hisi_trng_test/test_hisi_trngu_v1
 
 # pkg-config file
 lib/*.pc
+/.tff
+build/
