@@ -2751,7 +2751,7 @@ static void set_aead_auth_iv(struct wd_aead_msg *msg)
 
 	__u32 data_size = msg->in_bytes;
 	__u8 flags = 0x00;
-	__u8 cl, cm;
+	__u8 cl, cm, i;
 
 	/* CCM need to cal a_iv, GCM same as c_iv */
 	memcpy(msg->aiv, msg->iv, msg->iv_bytes);
@@ -2771,15 +2771,15 @@ static void set_aead_auth_iv(struct wd_aead_msg *msg)
 
 		msg->aiv[0] = flags;
 		/*
-		  * the last 32bit is counter's initial number,
-		  * but the nonce uses the first 16bit
-		  * the tail 16bit fill with the cipher length
-		  */
-		msg->aiv[msg->iv_bytes - IV_LAST_BYTE1] =
-			data_size & IV_LAST_BYTE_MASK;
-		data_size >>= IV_BYTE_OFFSET;
-		msg->aiv[msg->iv_bytes - IV_LAST_BYTE2] =
-			data_size & IV_LAST_BYTE_MASK;
+		 * the last 32bit is counter's initial number,
+		 * but the nonce uses the first 16bit
+		 * the tail 16bit fill with the cipher length
+		 * When CL is 3, the tail 24bit fill with the cipher length.
+		 */
+		for (i = 1; i <= cl + 1; i++) {
+			msg->aiv[msg->iv_bytes - i] = data_size & IV_LAST_BYTE_MASK;
+			data_size >>= IV_BYTE_OFFSET;
+		}
 	}
 }
 
