@@ -625,12 +625,12 @@ static int wd_aead_param_check(struct wd_aead_sess *sess,
 	return 0;
 }
 
+static bool wd_aead_atfork_registered;
+
 static void wd_aead_clear_status(void)
 {
 	wd_alg_clear_init(&wd_aead_setting.status);
 }
-
-static bool wd_aead_atfork_registered;
 
 static int wd_aead_init_nolock(struct wd_ctx_config *config, struct wd_sched *sched)
 {
@@ -657,21 +657,20 @@ static int wd_aead_init_nolock(struct wd_ctx_config *config, struct wd_sched *sc
 	if (ret < 0)
 		goto out_clear_sched;
 
-	ret = wd_alg_init_driver(&wd_aead_setting.config,
-					wd_aead_setting.driver);
-	if (ret)
-		goto out_clear_pool;
-
 	return 0;
 
-out_clear_pool:
-	wd_uninit_async_request_pool(&wd_aead_setting.pool);
 out_clear_sched:
 	wd_clear_sched(&wd_aead_setting.sched);
 out_clear_ctx_config:
 	wd_clear_ctx_config(&wd_aead_setting.config);
 
 	return ret;
+}
+
+static void wd_aead_uninit_nolock(void)
+{
+	wd_uninit_async_request_pool(&wd_aead_setting.pool);
+	wd_clear_sched(&wd_aead_setting.sched);
 }
 
 int wd_aead_init(struct wd_ctx_config *config, struct wd_sched *sched)
@@ -684,13 +683,6 @@ int wd_aead_init(struct wd_ctx_config *config, struct wd_sched *sched)
 			wd_aead_atfork_registered = true;
 	}
 
-	/* init1 path is HW-only; CE/SVE drivers require init2 */
-	if (sched->sched_policy == SCHED_POLICY_NONE ||
-	    sched->sched_policy == SCHED_POLICY_SINGLE) {
-		WD_ERR("init1 does not support NONE/SINGLE schedulers, use init2\n");
-		return -WD_EINVAL;
-	}
-
 	ret = wd_alg_try_init(&wd_aead_setting.status);
 	if (ret)
 		return ret;
@@ -699,9 +691,21 @@ int wd_aead_init(struct wd_ctx_config *config, struct wd_sched *sched)
 	if (ret)
 		goto out_clear_init;
 
+	/* init1 path is HW-only; CE/SVE drivers require init2 */
+	if (sched->sched_policy == SCHED_POLICY_NONE ||
+	    sched->sched_policy == SCHED_POLICY_SINGLE) {
+		WD_ERR("init1 does not support NONE/SINGLE schedulers, use init2\n");
+		ret = -WD_EINVAL;
+		goto out_clear_init;
+	}
+
 	ret = wd_aead_open_driver(WD_TYPE_V1);
 	if (ret)
 		goto out_clear_init;
+
+	ret = wd_aead_init_nolock(config, sched);
+	if (ret)
+		goto out_close_driver;
 
 	/* Driver discovery */
 	ret = wd_get_drv_array("aead", TASK_HW, "hisi_sec2",
@@ -742,12 +746,6 @@ out_close_driver:
 out_clear_init:
 	wd_alg_clear_init(&wd_aead_setting.status);
 	return ret;
-}
-
-static void wd_aead_uninit_nolock(void)
-{
-	wd_uninit_async_request_pool(&wd_aead_setting.pool);
-	wd_clear_sched(&wd_aead_setting.sched);
 }
 
 void wd_aead_uninit(void)
@@ -798,7 +796,7 @@ int wd_aead_init2_(char *alg, __u32 sched_type, int task_type,
 
 	state = wd_alg_try_init(&wd_aead_setting.status);
 	if (state)
-		goto out_uninit;
+		return state;
 
 	if (!alg || sched_type >= SCHED_POLICY_BUTT ||
 	     task_type < 0 || task_type >= TASK_MAX_TYPE) {
@@ -895,6 +893,8 @@ void wd_aead_uninit2(void)
 
 	wd_alg_uninit_driver(&wd_aead_setting.config);
 	wd_ctx_unbind_drivers(&wd_aead_setting.config);
+	wd_aead_setting.config.drv_array = NULL;
+	wd_aead_setting.config.drv_count = 0;
 	wd_aead_uninit_nolock();
 
 	wd_alg_attrs_uninit(&wd_aead_init_attrs);

@@ -2035,6 +2035,7 @@ static void wd_sched_set_param(handle_t h_sched_ctx,
 {
 	struct wd_sched_params *params = (struct wd_sched_params *)sched_param;
 	struct wd_sched_key *skey = (struct wd_sched_key *)sched_key;
+	struct wd_sched_ctx *sched_ctx = (struct wd_sched_ctx *)h_sched_ctx;
 
 	if (unlikely(!params || !skey)) {
 		WD_INFO("info: sched parmas or skey is NULL!\n");
@@ -2051,7 +2052,7 @@ static void wd_sched_set_param(handle_t h_sched_ctx,
 
 	/* If compat info provided, fix up pre-fetched ctxs */
 	if (skey->alg_name && skey->ctxs) {
-		wd_sched_skey_compat_filter(h_sched_ctx, skey,
+		wd_sched_skey_compat_filter(sched_ctx, skey,
 			&skey->sync_domain, SCHED_MODE_SYNC);
 		wd_sched_skey_compat_filter(sched_ctx, skey,
 			&skey->async_domain, SCHED_MODE_ASYNC);
