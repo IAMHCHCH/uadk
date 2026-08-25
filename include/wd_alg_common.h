@@ -41,6 +41,7 @@ extern "C" {
 
 /* Key size of digest */
 #define MAX_HMAC_KEY_SIZE	128U
+#define STATUS_ENABLE	(void *)0x1
 
 enum alg_task_type {
 	TASK_MIX = 0x0,
@@ -140,7 +141,7 @@ struct wd_ctx_params {
 };
 
 /*
- * struct wd_comp_sched - Define a scheduler.
+ * struct wd_sched - Define a scheduler.
  * @name:		Name of this scheduler.
  * @sched_policy:	Method for scheduler to perform scheduling
  * @sched_init: 	inited the scheduler input parameters.
@@ -157,10 +158,12 @@ struct wd_sched {
 	const char *name;
 	int sched_policy;
 	handle_t (*sched_init)(handle_t h_sched_ctx, void *sched_param);
+	void (*sched_uninit)(handle_t h_sched_ctx, handle_t h_sched_key);
 	__u32 (*pick_next_ctx)(handle_t h_sched_ctx,
 				  void *sched_key,
 				  const int sched_mode);
 	int (*poll_policy)(handle_t h_sched_ctx, __u32 expect, __u32 *count);
+	void (*set_param)(handle_t h_sched_ctx,	void *sched_key, void *sched_param);
 	handle_t h_sched_ctx;
 };
 
