@@ -163,6 +163,21 @@ out_free_list:
 	return ret;
 }
 
+static int wd_get_alg_class_type(const char *alg_name, char *alg_type)
+{
+	int ret;
+
+	ret = wd_get_alg_type(alg_name, alg_type);
+	if (ret)
+		return -WD_EINVAL;
+
+	/* all ECC types use sm2 to find device. */
+	if (!strcmp(alg_type, "ecc"))
+		strcpy(alg_type, "sm2");
+
+	return WD_SUCCESS;
+}
+
 /**
  * wd_hw_alloc_ctx() - HW driver's alloc_ctx callback.
  *
@@ -195,8 +210,8 @@ int wd_hw_alloc_ctx(char *alg_name, void *params, handle_t *ctx)
 	}
 	target_numa = ctx_params->numa_id;
 
-	/* Get algorithm type and device list */
-	ret = wd_get_alg_type(alg_name, alg_type);
+	/* Get algorithm class type and device list */
+	ret = wd_get_alg_class_type(alg_name, alg_type);
 	if (ret) {
 		WD_ERR("invalid: alg_name is NULL!\n");
 		return -WD_EINVAL;
