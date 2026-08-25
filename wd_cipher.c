@@ -40,7 +40,7 @@ static const unsigned char des_weak_keys[DES_WEAK_KEY_NUM][DES_KEY_SIZE] = {
 static const char *wd_cipher_alg_name[WD_CIPHER_ALG_TYPE_MAX][WD_CIPHER_MODE_TYPE_MAX] = {
 	{"ecb(sm4)", "cbc(sm4)", "ctr(sm4)", "xts(sm4)", "ofb(sm4)",
 	 "cfb(sm4)", "cbc-cs1(sm4)", "cbc-cs2(sm4)", "cbc-cs3(sm4)",
-	 "", "", "xts(sm4)"},
+	 "", "", "xts-gb(sm4)"},
 	{"ecb(aes)", "cbc(aes)", "ctr(aes)", "xts(aes)", "ofb(aes)",
 	 "cfb(aes)", "cbc-cs1(aes)", "cbc-cs2(aes)", "cbc-cs3(aes)"},
 	{"ecb(des)", "cbc(des)",},

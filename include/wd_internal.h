@@ -20,6 +20,7 @@ extern "C" {
 #define MAX_FD_NUM	65535
 
 struct wd_ctx_h {
+	__u8 ctx_type;
 	int fd;
 	char dev_path[MAX_DEV_NAME_LEN];
 	char *dev_name;
@@ -27,17 +28,6 @@ struct wd_ctx_h {
 	unsigned long qfrs_offs[UACCE_QFRT_MAX];
 	void *qfrs_base[UACCE_QFRT_MAX];
 	struct uacce_dev *dev;
-	void *priv;
-};
-
-struct wd_soft_ctx {
-	int fd;
-	void *priv;
-};
-
-struct wd_ce_ctx {
-	int fd;
-	char *drv_name;
 	void *priv;
 };
 
@@ -60,6 +50,9 @@ struct wd_ctx_config_internal {
 	bool epoll_en;
 	unsigned long *msg_cnt;
 	char *alg_name;
+
+	struct wd_alg_driver **drv_array;
+	__u32 drv_count;
 };
 
 struct wd_datalist {
