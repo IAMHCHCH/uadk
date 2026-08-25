@@ -398,9 +398,6 @@ static int init_ctx_config2(struct acc_option *options)
 	/* init */
 	if (options->mem_type == UADK_AUTO)
 		ret = wd_comp_init2_(alg_name, SCHED_POLICY_RR, TASK_HW, &cparams);
-
-	if (ret)
-		ZIP_TST_PRT("failed to do comp init2!\n");
 	else
 		ret = wd_comp_init2_(alg_name, SCHED_POLICY_DEV, TASK_HW, &cparams);
 	if (ret) {
