@@ -60,6 +60,7 @@
 #define HZ_DECOMP_END			0x13
 
 #define HZ_CTX_ST_MASK			0x000f
+#define HZ_CTX_CORE_STATUS_MASK		0x1ff
 #define HZ_CTX_BFINAL_MASK		0x80
 #define HZ_CTX_STORE_MASK		0x7ffff
 #define HZ_LSTBLK_MASK			0x0100
@@ -81,6 +82,7 @@
 #define max_in_data_size(outl)		((__u32)(((__u64)(outl) << 3) / 9) & 0xfffffffc)
 
 #define HZ_MAX_SIZE			(8 * 1024 * 1024)
+#define LZ4_MAX_SIZE			((__u32)0x100000)
 #define HW_CTX_SIZE			0x10000
 
 #define RSV_OFFSET			64
@@ -726,15 +728,12 @@ static int check_lz4_msg(struct wd_comp_msg *msg, enum wd_buff_type buf_type)
 		return -WD_EINVAL;
 	}
 
-	if (buf_type != WD_FLAT_BUF)
-		return 0;
-
-	if (unlikely(msg->req.src_len == 0 || msg->req.src_len > HZ_MAX_SIZE)) {
-		WD_ERR("invalid: lz4 input size can't be zero or more than 8M size max!\n");
+	if (unlikely(msg->req.src_len == 0 || msg->req.src_len > LZ4_MAX_SIZE)) {
+		WD_ERR("invalid: lz4 input size can't be zero or more than 1M size max!\n");
 		return -WD_EINVAL;
 	}
 
-	if (unlikely(msg->avail_out > HZ_MAX_SIZE))
+	if (unlikely(msg->avail_out > HZ_MAX_SIZE && buf_type == WD_FLAT_BUF))
 		msg->avail_out = HZ_MAX_SIZE;
 
 	return 0;
@@ -1672,6 +1671,7 @@ static int parse_zip_sqe(struct hisi_qp *qp, struct hisi_zip_sqe *sqe,
 			 struct wd_comp_msg *msg)
 {
 	__u32 buf_type = (sqe->dw9 & HZ_BUF_TYPE_MASK) >> BUF_TYPE_SHIFT;
+	__u16 ctx_core_status = sqe->isize & HZ_CTX_CORE_STATUS_MASK;
 	__u32 ctx_win_len = sqe->ctx_dw2 & CTX_WIN_LEN_MASK;
 	__u16 ctx_st = sqe->ctx_dw0 & HZ_CTX_ST_MASK;
 	__u16 lstblk = sqe->dw3 & HZ_LSTBLK_MASK;
@@ -1729,6 +1729,18 @@ static int parse_zip_sqe(struct hisi_qp *qp, struct hisi_zip_sqe *sqe,
 	/* last block no space when decomping, need resend null size req */
 	if (ctx_st == HZ_DECOMPING_NO_SPACE && recv_msg->req.src_len == recv_msg->in_cons &&
 	    (sqe->ctx_dw0 & HZ_CTX_BFINAL_MASK) && (sqe->ctx_dw1 & HZ_CTX_STORE_MASK))
+		recv_msg->req.status = WD_EAGAIN;
+
+	/*
+	 * The ctx_core_status reflects the hardware context state.
+	 * In stateful decompression, if it is non-zero while neither
+	 * input is consumed nor output produced, the hardware
+	 * needs the request to be resent with more input and output,
+	 * so report WD_EAGAIN to the user.
+	 */
+	if (!recv_msg->req.status && recv_msg->stream_mode == WD_COMP_STATEFUL &&
+	    recv_msg->req.op_type == WD_DIR_DECOMPRESS && ctx_core_status &&
+	    !recv_msg->in_cons && !recv_msg->produced)
 		recv_msg->req.status = WD_EAGAIN;
 
 	/*
