@@ -7,7 +7,6 @@
 #define WD_INTERNAL_H
 
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdbool.h>
 #include "wd.h"
 #include "wd_alg.h"
