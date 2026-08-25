@@ -49,7 +49,7 @@ struct wd_ctx_config_internal {
 	void *priv;
 	bool epoll_en;
 	unsigned long *msg_cnt;
-	char *alg_name;
+	const char *alg_name;
 
 	struct wd_alg_driver **drv_array;
 	__u32 drv_count;

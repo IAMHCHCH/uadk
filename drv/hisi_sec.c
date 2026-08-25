@@ -793,7 +793,6 @@ static int sec_aead_get_extend_ops(void *ops)
 	.op_type_num = 1,\
 	.drv_data = NULL,\
 	.fallback = 0,\
-	.init_state = 0,\
 	.init = hisi_sec_init,\
 	.exit = hisi_sec_exit,\
 	.send = alg_type##_send,\

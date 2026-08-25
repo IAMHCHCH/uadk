@@ -1165,7 +1165,8 @@ int wd_get_dev_usage(struct uacce_dev *dev, const char *alg_name, __u8 alg_op_ty
 {
 	char *dev_name;
 	int ret;
-	if (!dev || !alg_name) {
+
+	if (!dev || !alg_name || !strlen(dev->algs)) {
 		WD_ERR("invalid: dev or alg name is NULL!\n");
 		return -WD_EINVAL;
 	}
