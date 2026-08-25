@@ -28,6 +28,7 @@ extern "C" {
 #define MAX_STR_LEN		256
 #define CTX_TYPE_INVALID	9999
 #define POLL_TIME		1000
+#define WD_INIT2_MAX_RETRY	32
 
 /* Key size of chiper */
 #define MAX_CIPHER_KEY_SIZE	64

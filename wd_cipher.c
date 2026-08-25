@@ -502,6 +502,7 @@ int wd_cipher_init2_(char *alg, __u32 sched_type, int task_type,
 	struct wd_ctx_nums cipher_ctx_num[WD_CIPHER_DECRYPTION + 1] = {0};
 	struct wd_ctx_params cipher_ctx_params = {0};
 	int state, ret = -WD_EINVAL;
+	int try_cnt = 0;
 	bool flag;
 
 	if (!wd_cipher_atfork_registered) {
@@ -530,6 +531,11 @@ int wd_cipher_init2_(char *alg, __u32 sched_type, int task_type,
 		goto out_uninit;
 
 	while (ret != 0) {
+		if (try_cnt++ >= WD_INIT2_MAX_RETRY) {
+			WD_ERR("failed to init2 after %d retries.\n",
+				  WD_INIT2_MAX_RETRY);
+			goto out_dlclose;
+		}
 		memset(&wd_cipher_setting.config, 0,
 		       sizeof(struct wd_ctx_config_internal));
 
@@ -557,7 +563,7 @@ int wd_cipher_init2_(char *alg, __u32 sched_type, int task_type,
 				wd_ctx_param_uninit(&cipher_ctx_params);
 				continue;
 			}
-			WD_ERR("fail to init alg attrs.\n");
+			WD_ERR("failed to init alg attrs.\n");
 			goto out_params_uninit;
 		}
 	}

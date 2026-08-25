@@ -311,6 +311,7 @@ int wd_ecc_init2_(char *alg, __u32 sched_type, int task_type, struct wd_ctx_para
 	struct wd_ctx_nums ecc_ctx_num[WD_EC_OP_MAX] = {0};
 	struct wd_ctx_params ecc_ctx_params = {0};
 	int state, ret = -WD_EINVAL;
+	int try_cnt = 0;
 	bool flag;
 
 	if (!wd_ecc_atfork_registered) {
@@ -339,6 +340,11 @@ int wd_ecc_init2_(char *alg, __u32 sched_type, int task_type, struct wd_ctx_para
 		goto out_clear_init;
 
 	while (ret) {
+		if (try_cnt++ >= WD_INIT2_MAX_RETRY) {
+			WD_ERR("failed to init2 after %d retries.\n",
+			       WD_INIT2_MAX_RETRY);
+			goto out_driver;
+		}
 		memset(&wd_ecc_setting.config, 0, sizeof(struct wd_ctx_config_internal));
 
 		/* Init ctx param and prepare for ctx request */
