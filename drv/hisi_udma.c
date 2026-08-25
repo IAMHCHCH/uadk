@@ -465,7 +465,7 @@ static int udma_init(void *conf, void *priv)
 
 	for (i = 0; i < config->ctx_num; i++) {
 		if (config->ctxs[i].ctx && config->ctxs[i].drv &&
-		     strcmp(config->ctxs[i].drv->drv_name, "hisi_udma") == 0) {
+		     strcmp(config->ctxs[i].drv->drv_name, "hisi_zip") == 0) {
 			is_match[i] = true;
 			count++;
 		} else {
@@ -526,36 +526,34 @@ out:
 	return ret;
 }
 
-static void udma_exit(struct wd_alg_driver *drv)
+static void udma_exit(void *priv)
 {
-	struct wd_ctx_config_internal *config;
-	struct hisi_udma_ctx *priv;
+	struct hisi_udma_ctx *uctx = priv;
 	handle_t h_qp;
 	__u32 i;
 
-	if (!drv || !drv->priv)
+	if (!priv)
 		return;
 
-	priv = (struct hisi_udma_ctx *)drv->priv;
-	config = &priv->config;
-	for (i = 0; i < config->ctx_num; i++) {
-		h_qp = (handle_t)wd_ctx_get_priv(config->ctxs[i].ctx);
-		udma_uninit_qp_priv(h_qp);
-		hisi_qm_free_qp(h_qp);
+	for (i = 0; i < uctx->ctx_num; i++) {
+		h_qp = (handle_t)wd_ctx_get_priv(uctx->ctxs[i]->ctx);
+		if (h_qp) {
+			udma_uninit_qp_priv(h_qp);
+			hisi_qm_free_qp(h_qp);
+		}
 	}
-
-	free(priv);
-	drv->priv = NULL;
+	if (uctx->ctxs) {
+		free(uctx->ctxs);
+		uctx->ctxs = NULL;
+	}
 }
 
 static int udma_get_usage(void *param)
 {
 	struct hisi_dev_usage *udma_usage = (struct hisi_dev_usage *)param;
 	struct wd_alg_driver *drv = udma_usage->drv;
-	struct wd_ctx_config_internal *config;
-	struct hisi_udma_ctx *priv;
+	struct hisi_udma_ctx *uctx;
 	char *ctx_dev_name;
-	handle_t ctx = 0;
 	handle_t qp = 0;
 	__u32 i;
 
@@ -564,24 +562,18 @@ static int udma_get_usage(void *param)
 		return -WD_EINVAL;
 	}
 
-	priv = (struct hisi_udma_ctx *)drv->priv;
-	if (!priv)
+	uctx = (struct hisi_udma_ctx *)drv->drv_data;
+	if (!uctx)
 		return -WD_EACCES;
 
-	config = &priv->config;
-	for (i = 0; i < config->ctx_num; i++) {
-		ctx_dev_name = wd_ctx_get_dev_name(config->ctxs[i].ctx);
+	for (i = 0; i < uctx->ctx_num; i++) {
+		ctx_dev_name = wd_ctx_get_dev_name(uctx->ctxs[i]->ctx);
 		if (!strcmp(udma_usage->dev_name, ctx_dev_name)) {
-			ctx = config->ctxs[i].ctx;
-			break;
+			qp = (handle_t)wd_ctx_get_priv(uctx->ctxs[i]->ctx);
+			if (qp)
+				return hisi_qm_get_usage(qp, 0);
 		}
 	}
-
-	if (ctx)
-		qp = (handle_t)wd_ctx_get_priv(ctx);
-
-	if (qp)
-		return hisi_qm_get_usage(qp, UDMA_ALG_TYPE);
 
 	return -WD_EACCES;
 }
@@ -591,6 +583,7 @@ static struct wd_alg_driver udma_driver = {
 	.alg_name = "udma",
 	.calc_type = UADK_ALG_HW,
 	.priority = 100,
+	.priv_size = sizeof(struct hisi_udma_ctx),
 	.queue_num = UDMA_CTX_Q_NUM_DEF,
 	.op_type_num = 1,
 	.fallback = 0,
@@ -599,6 +592,8 @@ static struct wd_alg_driver udma_driver = {
 	.send = udma_send,
 	.recv = udma_recv,
 	.get_usage = udma_get_usage,
+	.alloc_ctx = wd_hw_alloc_ctx,
+	.free_ctx = wd_hw_free_ctx,
 };
 
 #ifdef WD_STATIC_DRV
