@@ -359,7 +359,7 @@ void get_rand_data(u8 *addr, u32 size)
 	}
 
 	for (i = 0; i < num_u64; i++) {
-		/* Use nrand48£¬it will auto update rand_state */
+		/* Use nrand48Â£Â¬it will auto update rand_state */
 		rand48_result = nrand48(rand_state);
 		 *((u64 *)addr + i) = rand48_result;
 	}
