@@ -12,6 +12,7 @@
 #include <sys/types.h>
 #include "hisi_qm_udrv.h"
 #include "../include/drv/wd_udma_drv.h"
+#include "wd_drv.h"
 
 #define BIT(nr)			(1UL << (nr))
 #define UDMA_CTX_Q_NUM_DEF	1
@@ -100,7 +101,8 @@ struct udma_internal_addr {
 };
 
 struct hisi_udma_ctx {
-	struct wd_ctx_config_internal config;
+	struct wd_ctx_internal **ctxs;
+	__u32 ctx_num;
 };
 
 static int get_free_inter_addr(struct udma_internal_addr *inter_addr)
@@ -290,7 +292,7 @@ static void fill_init_value(struct udma_sqe *sqe, struct wd_udma_msg *msg)
 		memset(&sqe->init_val, msg->value, sizeof(__u64));
 }
 
-static int udma_send(struct wd_alg_driver *drv, handle_t ctx, void *udma_msg)
+static int udma_send(handle_t ctx, void *udma_msg)
 {
 	handle_t h_qp = (handle_t)wd_ctx_get_priv(ctx);
 	struct hisi_qp *qp = (struct hisi_qp *)h_qp;
@@ -342,7 +344,7 @@ static void dump_udma_msg(struct udma_sqe *sqe, struct wd_udma_msg *msg)
 	       "op_type:%u addr_num:%d.\n", msg->op_type, msg->addr_num);
 }
 
-static int udma_recv(struct wd_alg_driver *drv, handle_t ctx, void *udma_msg)
+static int udma_recv(handle_t ctx, void *udma_msg)
 {
 	handle_t h_qp = (handle_t)wd_ctx_get_priv(ctx);
 	struct hisi_qp *qp = (struct hisi_qp *)h_qp;
@@ -442,36 +444,61 @@ free_inter_addr:
 	return ret;
 }
 
-static int udma_init(struct wd_alg_driver *drv, void *conf)
+static int udma_init(void *conf, void *priv)
 {
 	struct wd_ctx_config_internal *config = conf;
+	struct hisi_udma_ctx *uctx = priv;
 	struct hisi_qm_priv qm_priv;
-	struct hisi_udma_ctx *priv;
-	handle_t h_qp = 0;
-	handle_t h_ctx;
-	__u32 i, j;
+	__u32 i, j, count = 0;
+	bool *is_match;
+	handle_t h_qp;
 	int ret;
 
 	if (!config || !config->ctx_num) {
-		WD_ERR("invalid: udma init config is null or ctx num is 0!\n");
+		WD_ERR("invalid: input config or ctx num is null!\n");
 		return -WD_EINVAL;
 	}
 
-	priv = malloc(sizeof(struct hisi_udma_ctx));
-	if (!priv)
+	is_match = malloc(config->ctx_num * sizeof(bool));
+	if (!is_match)
 		return -WD_ENOMEM;
+
+	for (i = 0; i < config->ctx_num; i++) {
+		if (config->ctxs[i].ctx && config->ctxs[i].drv &&
+		     strcmp(config->ctxs[i].drv->drv_name, "hisi_udma") == 0) {
+			is_match[i] = true;
+			count++;
+		} else {
+			is_match[i] = false;
+		}
+	}
+
+	if (!count) {
+		WD_ERR("invalid: valid driver number is zero!\n");
+		free(is_match);
+		return -WD_EINVAL;
+	}
+
+	uctx->ctxs = calloc(count, sizeof(struct wd_ctx_internal *));
+	if (!uctx->ctxs) {
+		free(is_match);
+		return -WD_ENOMEM;
+	}
+	uctx->ctx_num = count;
 
 	qm_priv.op_type = UDMA_ALG_TYPE;
 	qm_priv.sqe_size = sizeof(struct udma_sqe);
+	count = 0;
 	/* Allocate qp for each context */
 	for (i = 0; i < config->ctx_num; i++) {
-		h_ctx = config->ctxs[i].ctx;
+		if (!is_match[i])
+			continue;
 		qm_priv.qp_mode = config->ctxs[i].ctx_mode;
 		/* Setting the epoll en to 0 for ASYNC ctx */
 		qm_priv.epoll_en = (qm_priv.qp_mode == CTX_MODE_SYNC) ?
 				    config->epoll_en : 0;
 		qm_priv.idx = i;
-		h_qp = hisi_qm_alloc_qp(&qm_priv, h_ctx);
+		h_qp = hisi_qm_alloc_qp(&qm_priv, config->ctxs[i].ctx);
 		if (!h_qp) {
 			ret = -WD_ENOMEM;
 			goto out;
@@ -480,20 +507,22 @@ static int udma_init(struct wd_alg_driver *drv, void *conf)
 		ret = udma_init_qp_priv(h_qp);
 		if (ret)
 			goto free_h_qp;
+		uctx->ctxs[count++] = &config->ctxs[i];
 	}
-	memcpy(&priv->config, config, sizeof(struct wd_ctx_config_internal));
-	drv->priv = priv;
 
+	free(is_match);
 	return WD_SUCCESS;
+
 free_h_qp:
 	hisi_qm_free_qp(h_qp);
 out:
-	for (j = 0; j < i; j++) {
-		h_qp = (handle_t)wd_ctx_get_priv(config->ctxs[j].ctx);
+	for (j = 0; j < count; j++) {
+		h_qp = (handle_t)wd_ctx_get_priv(uctx->ctxs[j]->ctx);
 		udma_uninit_qp_priv(h_qp);
 		hisi_qm_free_qp(h_qp);
 	}
-	free(priv);
+	free(uctx->ctxs);
+	free(is_match);
 	return ret;
 }
 

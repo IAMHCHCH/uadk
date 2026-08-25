@@ -19,9 +19,10 @@
 #define STREAM_CHUNK			(128 * 1024)
 #define WD_ZLIB_HEADER_SZ		2
 #define WD_GZIP_HEADER_SZ		10
+#define WD_COMP_ALG_TYPE_V1		"comp"
 
 static const char *wd_comp_alg_name[WD_COMP_ALG_MAX] = {
-	"zlib", "gzip", "deflate", "lz77_zstd", "lz4", "lz77_only"
+	"deflate", "zlib", "gzip", "lz77_zstd", "lz4", "lz77_only"
 };
 
 struct wd_comp_sess {
@@ -35,14 +36,17 @@ struct wd_comp_sess {
 	void *sched_key;
 	struct wd_mm_ops mm_ops;
 	enum wd_mem_type mm_type;
+	bool strm_ctx_fixed;
+	__u32 strm_sync_ctx_idx;
+
 };
 
 struct wd_comp_setting {
 	enum wd_status status;
+	enum wd_init_type init_type;
 	struct wd_ctx_config_internal config;
 	struct wd_sched sched;
 	struct wd_async_msg_pool pool;
-	struct wd_alg_driver *driver;
 	void *dlhandle;
 	void *dlh_list;
 } wd_comp_setting;
@@ -60,20 +64,16 @@ static void wd_comp_close_driver(int init_type)
 	}
 
 	if (wd_comp_setting.dlhandle) {
-		wd_release_drv(wd_comp_setting.driver);
 		dlclose(wd_comp_setting.dlhandle);
 		wd_comp_setting.dlhandle = NULL;
 	}
 #else
-	wd_release_drv(wd_comp_setting.driver);
 	hisi_zip_remove();
 #endif
 }
 
 static int wd_comp_open_driver(int init_type)
 {
-	struct wd_alg_driver *driver = NULL;
-	const char *alg_name = "zlib";
 #ifndef WD_STATIC_DRV
 	char lib_path[PATH_MAX];
 	int ret;
@@ -107,17 +107,10 @@ static int wd_comp_open_driver(int init_type)
 	if (init_type == WD_TYPE_V2)
 		return WD_SUCCESS;
 #endif
-	driver = wd_request_drv(alg_name, false);
-	if (!driver) {
-		wd_comp_close_driver(WD_TYPE_V1);
-		WD_ERR("failed to get %s driver support\n", alg_name);
-		return -WD_EINVAL;
-	}
-
-	wd_comp_setting.driver = driver;
-
 	return WD_SUCCESS;
 }
+
+static bool wd_comp_atfork_registered;
 
 static void wd_comp_clear_status(void)
 {
@@ -163,8 +156,7 @@ static int wd_comp_init_nolock(struct wd_ctx_config *config, struct wd_sched *sc
 	if (ret < 0)
 		goto out_clear_sched;
 
-	ret = wd_alg_init_driver(&wd_comp_setting.config,
-					wd_comp_setting.driver);
+	ret = wd_alg_init_driver(&wd_comp_setting.config);
 	if (ret)
 		goto out_clear_pool;
 

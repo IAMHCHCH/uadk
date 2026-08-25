@@ -17,17 +17,17 @@
 #include "drv/isa_ce_sm3.h"
 #include "drv/wd_digest_drv.h"
 #include "wd_digest.h"
-#include "wd_util.h"
+#include "wd_drv.h"
 
 #define SM3_ALIGN_MASK 63U
 
 typedef void (sm3_ce_block_fn)(__u32 word_reg[SM3_STATE_WORDS],
 				const unsigned char *src, size_t blocks);
 
-static int sm3_ce_drv_init(struct wd_alg_driver *drv, void *conf);
-static void sm3_ce_drv_exit(struct wd_alg_driver *drv);
-static int sm3_ce_drv_send(struct wd_alg_driver *drv, handle_t ctx, void *digest_msg);
-static int sm3_ce_drv_recv(struct wd_alg_driver *drv, handle_t ctx, void *digest_msg);
+static int sm3_ce_drv_init(void *conf, void *priv);
+static void sm3_ce_drv_exit(void *priv);
+static int sm3_ce_drv_send(handle_t ctx, void *digest_msg);
+static int sm3_ce_drv_recv(handle_t ctx, void *digest_msg);
 static int sm3_ce_get_usage(void *param);
 
 static struct wd_alg_driver sm3_ce_alg_driver = {
@@ -35,6 +35,7 @@ static struct wd_alg_driver sm3_ce_alg_driver = {
 	.alg_name = "sm3",
 	.calc_type = UADK_ALG_CE_INSTR,
 	.priority = 200,
+	.priv_size = sizeof(struct sm3_ce_drv_ctx),
 	.queue_num = 1,
 	.op_type_num = 1,
 	.fallback = 0,
@@ -43,6 +44,8 @@ static struct wd_alg_driver sm3_ce_alg_driver = {
 	.send = sm3_ce_drv_send,
 	.recv = sm3_ce_drv_recv,
 	.get_usage = sm3_ce_get_usage,
+	.alloc_ctx = wd_soft_alloc_ctx,
+	.free_ctx = wd_soft_free_ctx,
 };
 
 static void __attribute__((constructor)) sm3_ce_probe(void)

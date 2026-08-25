@@ -201,6 +201,10 @@ int wd_hw_alloc_ctx(char *alg_name, void *params, handle_t *ctx)
 		WD_ERR("invalid: alg_name is NULL!\n");
 		return -WD_EINVAL;
 	}
+	if (!strcmp(alg_type, "ecc"))
+		(void)strcpy(alg_type, "sm2");
+	if (!strcmp(alg_type, "comp"))
+		(void)strcpy(alg_type, "zlib");
 
 	dev_list = wd_get_accel_list(alg_type);
 	if (!dev_list) {

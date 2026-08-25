@@ -28,13 +28,10 @@
 #include "wd_internal.h"
 
 #define MAX_POLL_TIMES			1000
-#define HUNGRY_LOAD_THRESHOLD		256
 #define SKEY_CTX_MAX_NUM		16
 #define SKEY_MAX_THREAD_NUM		64
 #define SKEY_LOAD_UPDATE_INTERVAL 1
 #define HW_QUEUE_FULL_DEPTH		1024
-
-#define MAX_NUMA_NODES		(NUMA_NUM_NODES >> 5)
 
 /* ============================================================================
  * Hash Table Configuration
@@ -42,7 +39,6 @@
  */
 #define WD_SCHED_MAX_BUCKETS		512
 #define WD_SCHED_MIN_BUCKETS		32
-#define WD_SCHED_LOAD_FACTOR		0.75f
 #define HASH_PRIME1			73
 #define HASH_PRIME2			13
 #define HASH_PRIME3			7
@@ -239,6 +235,10 @@ struct wd_sched_ctx {
 	__u32 skey_num;
 	pthread_mutex_t skey_lock;
 	struct wd_sched_key *skey[SKEY_MAX_THREAD_NUM];
+
+	/* First ctx index per mode, used by SINGLE/NONE. */
+	__u32 sync_idx;
+	__u32 async_idx;
 };
 
 /* ============================================================================
@@ -904,6 +904,130 @@ static void wd_sched_skey_domain_destroy(struct wd_sched_key_domain *key_domain)
 	wd_sched_skey_cache_uninit(&key_domain->idx_cache);
 }
 
+static __u32 wd_sched_find_compatible_ctx(struct wd_sched_ctx *sched_ctx,
+					   struct wd_sched_key *skey,
+					   int region, int sched_mode)
+{
+	struct wd_sched_ctx_domain *domain;
+	__u32 i, ctx_idx, prop;
+
+	for (prop = 0; prop < UADK_ALG_TYPE_MAX; prop++) {
+		domain = wd_sched_hash_table_lookup(sched_ctx->domain_hash_table,
+						    region, sched_mode, skey->type, prop);
+		if (!domain || !domain->valid)
+			continue;
+		for (i = 0; i < domain->total_ctx_count; i++) {
+			ctx_idx = wd_sched_domain_get_next_rr(domain);
+			if (ctx_idx == INVALID_POS)
+				continue;
+			if (skey->ctxs[ctx_idx].drv &&
+			    wd_alg_match_drv(skey->ctxs[ctx_idx].drv, skey->alg_name))
+				return ctx_idx;
+		}
+	}
+
+	return INVALID_POS;
+}
+
+static __u32 wd_sched_get_new_ctx(struct wd_sched_ctx *sched_ctx,
+				  struct wd_sched_key *skey,
+				  int sched_mode)
+{
+	int region_id = skey->region_id;
+	__u8 ctx_prop = skey->ctx_prop;
+	__u32 op_type = skey->type;
+	__u32 ctx_idx;
+	int r;
+
+	if (sched_mode >= SCHED_MODE_BUTT ||
+	    op_type >= sched_ctx->type_num || ctx_prop >= UADK_ALG_TYPE_MAX) {
+		WD_ERR("invalid: region: %d, mode: %d, type: %u!, prop: %u\n",
+		       region_id, sched_mode, op_type, ctx_prop);
+		return INVALID_POS;
+	}
+
+	if (region_id < 0 ||
+	    (sched_ctx->policy != SCHED_POLICY_DEV &&
+	     region_id >= sched_ctx->region_num)) {
+		WD_ERR("invalid: region_id is %d, region_num is %u!\n",
+		       region_id, sched_ctx->region_num);
+		return INVALID_POS;
+	}
+
+	if (!sched_ctx->domain_hash_table)
+		return INVALID_POS;
+
+	/* Try current region first */
+	ctx_idx = wd_sched_find_compatible_ctx(sched_ctx, skey, region_id, sched_mode);
+	if (ctx_idx != INVALID_POS)
+		return ctx_idx;
+
+	/* DEV policy must not cross region */
+	if (sched_ctx->policy == SCHED_POLICY_DEV)
+		return INVALID_POS;
+
+	/* Cross-region fallback: try all other regions */
+	for (r = 0; r < sched_ctx->region_num; r++) {
+		if (r == region_id)
+			continue;
+		ctx_idx = wd_sched_find_compatible_ctx(sched_ctx, skey, r, sched_mode);
+		if (ctx_idx != INVALID_POS)
+			return ctx_idx;
+	}
+
+	return INVALID_POS;
+}
+
+/**
+ * wd_sched_skey_compat_filter - Filter and replace incompatible ctxs in domain cache
+ * @sched_ctx: Scheduler context
+ * @skey: Session key with alg_name and ctxs
+ * @domain: Target domain (sync or async)
+ * @sched_mode: SCHED_MODE_SYNC or SCHED_MODE_ASYNC
+ *
+ * For each ctx in domain cache, check if it supports alg_name.
+ * If not, find a compatible replacement from the global domain.
+ */
+static void wd_sched_skey_compat_filter(struct wd_sched_ctx *sched_ctx,
+	struct wd_sched_key *skey, struct wd_sched_key_domain *domain, int sched_mode)
+{
+	__u32 ctx_idx, new_ctx;
+	__u32 i;
+
+	if (!skey || !skey->alg_name || !skey->ctxs || !domain)
+		return;
+
+	/* Skip uninitialized domains (no ctxs cached) */
+	if (!domain->idx_cache.valid_count)
+		return;
+
+	pthread_mutex_lock(&domain->lock);
+
+	for (i = 0; i < domain->idx_cache.valid_count; i++) {
+		ctx_idx = domain->idx_cache.idx_list[i];
+
+		/* Check if current ctx is compatible */
+		if (skey->ctxs[ctx_idx].drv &&
+		    wd_alg_match_drv(skey->ctxs[ctx_idx].drv, skey->alg_name)) {
+			/* Compatible, keep unchanged */
+			continue;
+		}
+
+		/* Not compatible, find a replacement from domain */
+		new_ctx = wd_sched_get_new_ctx(sched_ctx, skey, sched_mode);
+		if (new_ctx != INVALID_POS && new_ctx != ctx_idx) {
+			/* Found compatible ctx, replace */
+			domain->idx_cache.idx_list[i] = new_ctx;
+			__atomic_store_n(&domain->idx_cache.load_values[i], 0, __ATOMIC_RELAXED);
+		} else {
+			/* No compatible ctx found, mark as invalid */
+			domain->idx_cache.idx_list[i] = INVALID_POS;
+			WD_INFO("info: no compatible ctx found for alg %s!\n", skey->alg_name);
+		}
+	}
+
+	pthread_mutex_unlock(&domain->lock);
+}
 
 /**
  * wd_sched_poll_skey - Poll contexts for scheduler session
@@ -1444,10 +1568,17 @@ static handle_t sched_none_init(handle_t h_sched_ctx, void *sched_param)
 	return (handle_t)0;
 }
 
-static __u32 sched_none_pick_next_ctx(handle_t sched_ctx,
+static __u32 sched_none_pick_next_ctx(handle_t h_sched_ctx,
 				      void *sched_key, const int sched_mode)
 {
-	return 0;
+	struct wd_sched_ctx *sched_ctx = (struct wd_sched_ctx *)h_sched_ctx;
+
+	if (!sched_ctx) {
+		WD_ERR("invalid: sched ctx is NULL!\n");
+		return INVALID_POS;
+	}
+
+	return sched_mode == SCHED_MODE_SYNC ? sched_ctx->sync_idx : sched_ctx->async_idx;
 }
 
 static int sched_none_poll_policy(handle_t h_sched_ctx,
@@ -1455,7 +1586,7 @@ static int sched_none_poll_policy(handle_t h_sched_ctx,
 {
 	struct wd_sched_ctx *sched_ctx = (struct wd_sched_ctx *)h_sched_ctx;
 	__u32 loop_times = MAX_POLL_TIMES + expect;
-	__u32 poll_num = 0;
+	__u32 poll_num = 0, poll_idx;
 	int ret;
 
 	if (!sched_ctx || !sched_ctx->poll_func) {
@@ -1463,9 +1594,15 @@ static int sched_none_poll_policy(handle_t h_sched_ctx,
 		return -WD_EINVAL;
 	}
 
+	poll_idx = sched_ctx->async_idx;
+	if (poll_idx == INVALID_POS) {
+		WD_ERR("invalid: no async ctx available to poll!\n");
+		return -WD_EINVAL;
+	}
+
 	while (loop_times > 0) {
 		loop_times--;
-		ret = sched_ctx->poll_func(0, 1, &poll_num);
+		ret = sched_ctx->poll_func(poll_idx, 1, &poll_num);
 		if ((ret < 0) && (ret != -WD_EAGAIN))
 			return ret;
 		else if (ret == -WD_EAGAIN)
@@ -1484,13 +1621,17 @@ static handle_t sched_single_init(handle_t h_sched_ctx, void *sched_param)
 	return (handle_t)0;
 }
 
-static __u32 sched_single_pick_next_ctx(handle_t sched_ctx,
+static __u32 sched_single_pick_next_ctx(handle_t h_sched_ctx,
 					void *sched_key, const int sched_mode)
 {
-	if (sched_mode)
-		return 1;
-	else
-		return 0;
+	struct wd_sched_ctx *sched_ctx = (struct wd_sched_ctx *)h_sched_ctx;
+
+	if (!sched_ctx) {
+		WD_ERR("invalid: sched ctx is NULL!\n");
+		return INVALID_POS;
+	}
+
+	return sched_mode == SCHED_MODE_SYNC ? sched_ctx->sync_idx : sched_ctx->async_idx;
 }
 
 static int sched_single_poll_policy(handle_t h_sched_ctx,
@@ -1498,7 +1639,7 @@ static int sched_single_poll_policy(handle_t h_sched_ctx,
 {
 	struct wd_sched_ctx *sched_ctx = (struct wd_sched_ctx *)h_sched_ctx;
 	__u32 loop_times = MAX_POLL_TIMES + expect;
-	__u32 poll_num = 0;
+	__u32 poll_num = 0, poll_idx;
 	int ret;
 
 	if (!sched_ctx || !sched_ctx->poll_func) {
@@ -1506,9 +1647,15 @@ static int sched_single_poll_policy(handle_t h_sched_ctx,
 		return -WD_EINVAL;
 	}
 
+	poll_idx = sched_ctx->async_idx;
+	if (poll_idx == INVALID_POS) {
+		WD_ERR("invalid: no async ctx available to poll!\n");
+		return -WD_EINVAL;
+	}
+
 	while (loop_times > 0) {
 		loop_times--;
-		ret = sched_ctx->poll_func(1, 1, &poll_num);
+		ret = sched_ctx->poll_func(poll_idx, 1, &poll_num);
 		if ((ret < 0) && (ret != -WD_EAGAIN))
 			return ret;
 		else if (ret == -WD_EAGAIN)
@@ -1890,7 +2037,7 @@ static void wd_sched_set_param(handle_t h_sched_ctx,
 	struct wd_sched_key *skey = (struct wd_sched_key *)sched_key;
 
 	if (unlikely(!params || !skey)) {
-		WD_ERR("invalid: sched parmas or skey is NULL!\n");
+		WD_INFO("info: sched parmas or skey is NULL!\n");
 		return;
 	}
 
@@ -1902,6 +2049,13 @@ static void wd_sched_set_param(handle_t h_sched_ctx,
 	skey->alg_name = params->alg_name;
 	skey->ctxs = params->ctxs;
 
+	/* If compat info provided, fix up pre-fetched ctxs */
+	if (skey->alg_name && skey->ctxs) {
+		wd_sched_skey_compat_filter(h_sched_ctx, skey,
+			&skey->sync_domain, SCHED_MODE_SYNC);
+		wd_sched_skey_compat_filter(sched_ctx, skey,
+			&skey->async_domain, SCHED_MODE_ASYNC);
+	}
 }
 
 static struct wd_sched sched_table[SCHED_POLICY_BUTT] = {
@@ -2055,6 +2209,15 @@ int wd_sched_rr_instance(const struct wd_sched *sched, struct sched_params *para
 	}
 	domain->valid = true;
 
+	/* SINGLE/NONE: record first ctx index per mode. */
+	if (sched_ctx->policy == SCHED_POLICY_SINGLE ||
+	    sched_ctx->policy == SCHED_POLICY_NONE) {
+		if (mode == SCHED_MODE_SYNC && sched_ctx->sync_idx == INVALID_POS)
+			sched_ctx->sync_idx = param->begin;
+		else if (mode == SCHED_MODE_ASYNC && sched_ctx->async_idx == INVALID_POS)
+			sched_ctx->async_idx = param->begin;
+	}
+
 	return WD_SUCCESS;
 }
 
@@ -2172,6 +2335,8 @@ struct wd_sched *wd_sched_rr_alloc(__u8 sched_type, __u8 type_num,
 		goto err_destroy_hash;
 	}
 	sched_ctx->skey_num = 0;
+	sched_ctx->sync_idx = INVALID_POS;
+	sched_ctx->async_idx = INVALID_POS;
 
 	sched->h_sched_ctx = (handle_t)sched_ctx;
 	sched->sched_init = sched_table[sched_type].sched_init;

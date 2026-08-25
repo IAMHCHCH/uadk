@@ -1,8 +1,15 @@
 ACLOCAL_AMFLAGS = -I m4 -I./include
 AUTOMAKE_OPTIONS = foreign subdir-objects
 AM_CFLAGS=-Wall -Werror -fno-strict-aliasing -I$(top_srcdir)/include
-AM_CFLAGS+=-fPIC -fPIE -pie -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
-	   -O2 -ftrapv -Wl,-z,relro,-z,now -Wl,-s
+AM_CFLAGS+=-fPIC -fPIE -pie -fstack-protector-strong -ftrapv -Wl,-z,relro,-z,now
+
+if WD_DEBUG
+# Debug build: keep symbols, disable optimization and stripping for full stack traces
+AM_CFLAGS+=-g -O0 -fno-omit-frame-pointer -DDEBUG
+else
+# Release build: optimize and strip symbols
+AM_CFLAGS+=-O2 -D_FORTIFY_SOURCE=2 -Wl,-s
+endif
 CLEANFILES =
 
 if WITH_LOG_FILE
@@ -84,13 +91,13 @@ libhisi_zip_la_SOURCES=drv/hisi_comp.c hisi_comp.h drv/hisi_qm_udrv.c \
 
 libwd_crypto_la_SOURCES=wd_cipher.c wd_cipher.h wd_cipher_drv.h \
 			wd_aead.c wd_aead.h wd_aead_drv.h \
-			wd.c wd.h wd_alg.h \
 			wd_rsa.c wd_rsa.h wd_rsa_drv.h \
 			wd_dh.c wd_dh.h wd_dh_drv.h \
 			wd_ecc.c wd_ecc.h wd_ecc_drv.h \
 			wd_digest.c wd_digest.h wd_digest_drv.h \
 			wd_util.c wd_util.h \
-			wd_sched.c wd_sched.h
+			wd_sched.c wd_sched.h \
+			wd.c wd.h
 
 libhisi_sec_la_SOURCES=drv/hisi_sec.c drv/hisi_qm_udrv.c \
 		lib/crypto/aes.c lib/crypto/sm4.c lib/crypto/galois.c \
