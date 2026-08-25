@@ -7,8 +7,10 @@
 #define WD_INTERNAL_H
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include "wd.h"
+#include "wd_alg.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -41,11 +43,14 @@ struct wd_ce_ctx {
 };
 
 struct wd_ctx_internal {
-	handle_t ctx;
 	__u8 op_type;
 	__u8 ctx_mode;
+	__u8 ctx_type;
+	handle_t ctx;
 	__u16 sqn;
 	pthread_spinlock_t lock;
+	struct wd_alg_driver *drv;
+	__u32 hw_load;
 };
 
 struct wd_ctx_config_internal {
@@ -62,6 +67,17 @@ struct wd_datalist {
 	void *data;
 	__u32 len;
 	struct wd_datalist *next;
+};
+
+struct wd_sched_params {
+	__u32 pkt_size;
+	/* block mode or stream mode */
+	__u16 data_mode;
+	__u16 prio_mode;
+
+	/* Compat filtering parameters for session-ctx matching */
+	const char *alg_name;
+	struct wd_ctx_internal *ctxs;
 };
 
 int memcmp_consttime(const void *s1, const void *s2, size_t n);

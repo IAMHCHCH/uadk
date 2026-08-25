@@ -64,10 +64,13 @@ extern "C" {
 #endif
 
 enum alg_dev_type {
-	UADK_ALG_SOFT = 0x0,
-	UADK_ALG_CE_INSTR = 0x1,
-	UADK_ALG_SVE_INSTR = 0x2,
-	UADK_ALG_HW = 0x3
+	UADK_ALG_HW		= 0x0,
+	UADK_ALG_CE_INSTR	= 0x1,
+	UADK_ALG_SVE_INSTR	= 0x2,
+	UADK_ALG_SOFT		= 0x3,
+	UADK_ALG_NPU		= 0x4,
+	UADK_ALG_GPU		= 0x5,
+	UADK_ALG_TYPE_MAX,
 };
 
 /*
