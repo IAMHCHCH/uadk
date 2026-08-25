@@ -803,6 +803,7 @@ int wd_join_gather_init(char *alg, __u32 sched_type, int task_type,
 	struct wd_ctx_params join_gather_ctx_params = {0};
 	struct wd_ctx_nums join_gather_ctx_num = {0};
 	int ret = -WD_EINVAL;
+	int try_cnt = 0;
 	int state;
 	bool flag;
 
@@ -832,6 +833,11 @@ int wd_join_gather_init(char *alg, __u32 sched_type, int task_type,
 		goto out_uninit;
 
 	while (ret != 0) {
+		if (try_cnt++ >= WD_INIT2_MAX_RETRY) {
+			WD_ERR("failed to init2 after %d retries.\n",
+			       WD_INIT2_MAX_RETRY);
+			goto out_driver;
+		}
 		memset(&wd_join_gather_setting.config, 0, sizeof(struct wd_ctx_config_internal));
 		join_gather_ctx_params.ctx_set_num = &join_gather_ctx_num;
 		ret = wd_ctx_param_init(&join_gather_ctx_params, ctx_params, alg,

@@ -816,6 +816,11 @@ int wd_aead_init2_(char *alg, __u32 sched_type, int task_type,
 		goto out_uninit;
 
 	while (ret != 0) {
+		if (try_cnt++ >= WD_INIT2_MAX_RETRY) {
+			WD_ERR("failed to init2 after %d retries.\n",
+			       WD_INIT2_MAX_RETRY);
+			goto out_dlclose;
+		}
 		memset(&wd_aead_setting.config, 0, sizeof(struct wd_ctx_config_internal));
 		/* Init ctx param and prepare for ctx request */
 		aead_ctx_params.ctx_set_num = aead_ctx_num;

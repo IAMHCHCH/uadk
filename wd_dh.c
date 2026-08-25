@@ -240,6 +240,7 @@ int wd_dh_init2_(char *alg, __u32 sched_type, int task_type, struct wd_ctx_param
 	struct wd_ctx_nums dh_ctx_num[WD_DH_PHASE2] = {0};
 	struct wd_ctx_params dh_ctx_params = {0};
 	int state, ret = -WD_EINVAL;
+	int try_cnt = 0;
 
 	if (!wd_dh_atfork_registered) {
 		if (pthread_atfork(NULL, NULL, wd_dh_clear_status) == 0)
@@ -266,6 +267,11 @@ int wd_dh_init2_(char *alg, __u32 sched_type, int task_type, struct wd_ctx_param
 		goto out_clear_init;
 
 	while (ret) {
+		if (try_cnt++ >= WD_INIT2_MAX_RETRY) {
+			WD_ERR("failed to init2 after %d retries.\n",
+			       WD_INIT2_MAX_RETRY);
+			goto out_driver;
+		}
 		memset(&wd_dh_setting.config, 0, sizeof(struct wd_ctx_config_internal));
 		/* Init ctx param and prepare for ctx request */
 		dh_ctx_params.ctx_set_num = dh_ctx_num;
