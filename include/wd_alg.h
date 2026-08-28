@@ -61,6 +61,11 @@ extern "C" {
 # define HWCAP2                 26
 # define HWCAP2_SVE2            (1 << 1)
 # define HWCAP2_RNG             (1 << 16)
+#else
+/* Define as 0 on non-ARM architectures */
+# define HWCAP_CE_SM3           0
+# define HWCAP_CE_SM4           0
+# define HWCAP_SVE              0
 #endif
 
 enum alg_dev_type {

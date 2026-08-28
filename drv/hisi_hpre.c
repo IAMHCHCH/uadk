@@ -1183,7 +1183,7 @@ static bool big_than_one(const char *data, __u32 data_sz)
 
 static bool less_than_latter(struct wd_dtb *d, struct wd_dtb *n)
 {
-	char *d_data, *n_data;
+	unsigned char *d_data, *n_data;
 	__u32 shift, i;
 
 	if (d->dsize > n->dsize)
