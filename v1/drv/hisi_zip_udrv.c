@@ -447,7 +447,7 @@ int qm_parse_zip_sqe(void *hw_msg, const struct qm_queue_info *info,
 	qm_parse_zip_sqe_set_status(recv_msg, status, lstblk, ctx_st);
 	if (ctx_st == HW_DECOMPING_NO_SPACE && recv_msg->in_size == recv_msg->in_cons &&
 	    ctx_bfinal && (sqe->ctx_dw1 & HZ_CTX_STORE_MASK))
-		recv_msg->status = WCRYPTO_DECOMP_BLK_NOSTART;
+		recv_msg->status = WCRYPTO_DECOMP_END_NOSPACE;
 
 	return 1;
 }
@@ -850,6 +850,7 @@ int qm_parse_zip_sqe_v3(void *hw_msg, const struct qm_queue_info *info,
 {
 	struct wcrypto_comp_msg *recv_msg = info->req_cache[i];
 	struct hisi_zip_sqe_v3 *sqe = hw_msg;
+	__u16 ctx_core_status = sqe->isize & HZ_CTX_CORE_STATUS_MASK;
 	__u16 ctx_bfinal = sqe->ctx_dw0 & HZ_CTX_BFINAL_MASK;
 	__u32 ctx_win_len = sqe->ctx_dw2 & CTX_WIN_LEN_MASK;
 	__u16 ctx_st = sqe->ctx_dw0 & HZ_CTX_ST_MASK;
@@ -912,7 +913,19 @@ int qm_parse_zip_sqe_v3(void *hw_msg, const struct qm_queue_info *info,
 	qm_parse_zip_sqe_set_status(recv_msg, status, lstblk, ctx_st);
 	if (ctx_st == HW_DECOMPING_NO_SPACE && recv_msg->in_size == recv_msg->in_cons &&
 	    ctx_bfinal && (sqe->ctx_dw1 & HZ_CTX_STORE_MASK))
-		recv_msg->status = WCRYPTO_DECOMP_BLK_NOSTART;
+		recv_msg->status = WCRYPTO_DECOMP_END_NOSPACE;
+
+	/*
+	 * The ctx_core_status reflects the hardware context state.
+	 * In stateful decompression, if it is non-zero while neither
+	 * input is consumed nor output produced, the hardware
+	 * needs the request to be resent with more input and output,
+	 * so report WD_EAGAIN to the user.
+	 */
+	if (!recv_msg->status && recv_msg->stream_mode == WCRYPTO_COMP_STATEFUL &&
+	    recv_msg->op_type == WCRYPTO_INFLATE && ctx_core_status &&
+	    !recv_msg->in_cons && !recv_msg->produced)
+		recv_msg->status = WD_EAGAIN;
 
 	/*
 	 * It need to analysis the data cache by hardware.

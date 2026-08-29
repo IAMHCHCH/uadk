@@ -1,8 +1,25 @@
 ACLOCAL_AMFLAGS = -I m4 -I./include
 AUTOMAKE_OPTIONS = foreign subdir-objects
-AM_CFLAGS=-Wall -Werror -fno-strict-aliasing -I$(top_srcdir)/include
-AM_CFLAGS+=-fPIC -fPIE -pie -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
-	   -O2 -ftrapv -Wl,-z,relro,-z,now -Wl,-s
+AM_CFLAGS=-std=gnu11 -Wall -Werror -Wextra -Wno-unused-parameter -Wfloat-equal \
+	  -fno-common -fno-strict-aliasing -I$(top_srcdir)/include
+AM_CFLAGS+=-fPIC -fPIE -pie -fstack-protector-strong -ftrapv -Wl,-z,relro,-z,now
+
+if WD_DEBUG
+# Debug build: keep symbols, disable optimization and stripping for full stack traces
+AM_CFLAGS+=-g -O0 -fno-omit-frame-pointer -DDEBUG
+else
+# Release build: optimize and strip symbols
+AM_CFLAGS+=-O2 -D_FORTIFY_SOURCE=2 -Wl,-s
+endif
+AM_CFLAGS += -Wall -Wuninitialized -Wno-error -Wno-error=format -Wundef \
+-Wunused -Wdate-time -Wfloat-equal -Wshadow -Wvla -Wdisabled-optimization \
+-Wempty-body -Wignored-qualifiers -Wimplicit-fallthrough=3 -Wtype-limits \
+-Wshift-negative-value -Wswitch-default -Wframe-larger-than=8192 -Wshift-overflow=2 \
+-Wwrite-strings -Wmissing-format-attribute -Wformat-nonliteral -Wduplicated-cond \
+-Wtrampolines -Wlogical-op -Wsuggest-attribute=format -Wduplicated-branches \
+-Wmissing-include-dirs -Wformat-signedness -Wmissing-declarations -Wreturn-local-addr \
+-Wredundant-decls -Wfloat-conversion -Wmissing-prototypes -Wstrict-prototypes
+
 CLEANFILES =
 
 if WITH_LOG_FILE
@@ -70,9 +87,10 @@ libwd_la_SOURCES=wd.c wd_mempool.c wd_bmm.c wd_bmm.h wd.h wd_alg.c wd_alg.h	\
 		 v1/drv/hisi_sec_udrv.c v1/drv/hisi_sec_udrv.h
 
 libwd_udma_la_SOURCES=wd_udma.h wd_udma_drv.h wd_udma.c \
-		     wd_util.c wd_util.h wd_sched.c wd_sched.h wd.c wd.h
+		      wd_util.c wd_util.h wd_sched.c wd_sched.h wd.c wd.h
 
-libwd_dae_la_SOURCES=wd_dae.h wd_agg.h wd_agg_drv.h wd_agg.c wd_join_gather.h wd_join_gather_drv.h wd_join_gather.c \
+libwd_dae_la_SOURCES=wd_dae.h wd_agg.h wd_agg_drv.h wd_agg.c \
+		     wd_join_gather.h wd_join_gather_drv.h wd_join_gather.c \
 		     wd_util.c wd_util.h wd_sched.c wd_sched.h wd.c wd.h
 
 libwd_comp_la_SOURCES=wd_comp.c wd_comp.h wd_comp_drv.h wd_util.c wd_util.h \
@@ -80,7 +98,8 @@ libwd_comp_la_SOURCES=wd_comp.c wd_comp.h wd_comp_drv.h wd_util.c wd_util.h \
 
 libhisi_zip_la_SOURCES=drv/hisi_comp.c hisi_comp.h drv/hisi_qm_udrv.c \
 		drv/hisi_comp_huf.c drv/hisi_comp_huf.h \
-		hisi_qm_udrv.h wd_comp_drv.h
+		hisi_qm_udrv.h wd_comp_drv.h \
+		drv/wd_drv.h drv/wd_drv.c
 
 libwd_crypto_la_SOURCES=wd_cipher.c wd_cipher.h wd_cipher_drv.h \
 			wd_aead.c wd_aead.h wd_aead_drv.h \
@@ -94,27 +113,32 @@ libwd_crypto_la_SOURCES=wd_cipher.c wd_cipher.h wd_cipher_drv.h \
 
 libhisi_sec_la_SOURCES=drv/hisi_sec.c drv/hisi_qm_udrv.c \
 		lib/crypto/aes.c lib/crypto/sm4.c lib/crypto/galois.c \
-		hisi_qm_udrv.h wd_cipher_drv.h wd_aead_drv.h aes.h sm4.h galois.h
+		hisi_qm_udrv.h wd_cipher_drv.h wd_aead_drv.h aes.h sm4.h galois.h \
+		drv/wd_drv.h drv/wd_drv.c
 
 libhisi_hpre_la_SOURCES=drv/hisi_hpre.c drv/hisi_qm_udrv.c \
-		hisi_qm_udrv.h
+		hisi_qm_udrv.h wd_rsa_drv.h wd_dh_drv.h wd_ecc_drv.h \
+		drv/wd_drv.h drv/wd_drv.c
 
 if ARCH_ARM64
 libisa_ce_la_SOURCES=arm_arch_ce.h drv/isa_ce_sm3.c drv/isa_ce_sm3_armv8.S isa_ce_sm3.h \
-		drv/isa_ce_sm4.c drv/isa_ce_sm4_armv8.S drv/isa_ce_sm4.h
+		drv/isa_ce_sm4.c drv/isa_ce_sm4_armv8.S drv/isa_ce_sm4.h wd_util.c wd_util.h \
+		drv/wd_drv.h drv/wd_drv.c
 
 libisa_sve_la_SOURCES=drv/hash_mb/hash_mb.c wd_digest_drv.h drv/hash_mb/hash_mb.h \
 		drv/hash_mb/sm3_sve_common.S drv/hash_mb/sm3_mb_asimd_x1.S \
 		drv/hash_mb/sm3_mb_asimd_x4.S drv/hash_mb/sm3_mb_sve.S \
 		drv/hash_mb/md5_sve_common.S drv/hash_mb/md5_mb_asimd_x1.S \
-		drv/hash_mb/md5_mb_asimd_x4.S drv/hash_mb/md5_mb_sve.S
+		drv/hash_mb/md5_mb_asimd_x4.S drv/hash_mb/md5_mb_sve.S \
+		drv/wd_drv.h drv/wd_drv.c
 endif
 
 libhisi_dae_la_SOURCES=drv/hisi_dae.c hisi_dae.h drv/hisi_qm_udrv.c \
-		hisi_qm_udrv.h drv/hisi_dae_join_gather.c drv/hisi_dae_common.c
+		hisi_qm_udrv.h drv/hisi_dae_join_gather.c drv/hisi_dae_common.c \
+		drv/wd_drv.h drv/wd_drv.c
 
 libhisi_udma_la_SOURCES=drv/hisi_udma.c drv/hisi_qm_udrv.c \
-		hisi_qm_udrv.h
+		hisi_qm_udrv.h drv/wd_drv.h drv/wd_drv.c
 
 if WD_STATIC_DRV
 AM_CFLAGS += -DWD_STATIC_DRV -fPIC
@@ -122,8 +146,8 @@ AM_CFLAGS += -DWD_NO_LOG
 
 libwd_la_LIBADD = $(libwd_la_OBJECTS) -ldl -lnuma -lpthread -lrt
 
-libwd_comp_la_LIBADD = $(libwd_la_OBJECTS) -ldl -lnuma -lpthread
-libwd_comp_la_DEPENDENCIES = libwd.la
+libwd_comp_la_LIBADD = $(libwd_la_OBJECTS) $(libhisi_zip_la_OBJECTS) -ldl -lpthread -lnuma
+libwd_comp_la_DEPENDENCIES = libwd.la libhisi_zip.la
 
 libhisi_zip_la_LIBADD = -ldl -lpthread
 

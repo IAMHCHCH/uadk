@@ -5,6 +5,7 @@
 #include "drv/wd_comp_drv.h"
 #include "drv/hisi_comp_huf.h"
 #include "hisi_qm_udrv.h"
+#include "wd_drv.h"
 
 #define	ZLIB				0
 #define	GZIP				1
@@ -15,6 +16,7 @@
 #define ZLIB_HEADER			"\x78\x9c"
 #define ZLIB_HEADER_SZ			2
 #define ZIP_CTX_Q_NUM_DEF		1
+#define WD_COMP_ALG_TYPE_V1		"deflate"
 /*
  * We use a extra field for gzip block length. So the fourth byte is \x04.
  * This is necessary because our software don't know the size of block when
@@ -58,6 +60,7 @@
 #define HZ_DECOMP_END			0x13
 
 #define HZ_CTX_ST_MASK			0x000f
+#define HZ_CTX_CORE_STATUS_MASK		0x1ff
 #define HZ_CTX_BFINAL_MASK		0x80
 #define HZ_CTX_STORE_MASK		0x7ffff
 #define HZ_LSTBLK_MASK			0x0100
@@ -79,6 +82,7 @@
 #define max_in_data_size(outl)		((__u32)(((__u64)(outl) << 3) / 9) & 0xfffffffc)
 
 #define HZ_MAX_SIZE			(8 * 1024 * 1024)
+#define LZ4_MAX_SIZE			((__u32)0x100000)
 #define HW_CTX_SIZE			0x10000
 
 #define RSV_OFFSET			64
@@ -724,15 +728,12 @@ static int check_lz4_msg(struct wd_comp_msg *msg, enum wd_buff_type buf_type)
 		return -WD_EINVAL;
 	}
 
-	if (buf_type != WD_FLAT_BUF)
-		return 0;
-
-	if (unlikely(msg->req.src_len == 0 || msg->req.src_len > HZ_MAX_SIZE)) {
-		WD_ERR("invalid: lz4 input size can't be zero or more than 8M size max!\n");
+	if (unlikely(msg->req.src_len == 0 || msg->req.src_len > LZ4_MAX_SIZE)) {
+		WD_ERR("invalid: lz4 input size can't be zero or more than 1M size max!\n");
 		return -WD_EINVAL;
 	}
 
-	if (unlikely(msg->avail_out > HZ_MAX_SIZE))
+	if (unlikely(msg->avail_out > HZ_MAX_SIZE && buf_type == WD_FLAT_BUF))
 		msg->avail_out = HZ_MAX_SIZE;
 
 	return 0;
@@ -1473,11 +1474,11 @@ static void hisi_zip_sqe_ops_adapt(handle_t h_qp)
 	}
 }
 
-static int hisi_zip_init(struct wd_alg_driver *drv, void *conf)
+static int hisi_zip_init(void *conf, void *priv)
 {
 	struct wd_ctx_config_internal *config = conf;
+	struct hisi_zip_ctx *zip_ctx = (struct hisi_zip_ctx *)priv;
 	struct hisi_qm_priv qm_priv;
-	struct hisi_zip_ctx *priv;
 	handle_t h_qp = 0;
 	handle_t h_ctx;
 	__u32 i, j;
@@ -1487,11 +1488,7 @@ static int hisi_zip_init(struct wd_alg_driver *drv, void *conf)
 		return -WD_EINVAL;
 	}
 
-	priv = malloc(sizeof(struct hisi_zip_ctx));
-	if (!priv)
-		return -WD_EINVAL;
-
-	memcpy(&priv->config, config, sizeof(struct wd_ctx_config_internal));
+	memcpy(&zip_ctx->config, config, sizeof(struct wd_ctx_config_internal));
 	/* allocate qp for each context */
 	for (i = 0; i < config->ctx_num; i++) {
 		h_ctx = config->ctxs[i].ctx;
@@ -1509,7 +1506,6 @@ static int hisi_zip_init(struct wd_alg_driver *drv, void *conf)
 	}
 
 	hisi_zip_sqe_ops_adapt(h_qp);
-	drv->priv = priv;
 
 	return 0;
 out:
@@ -1517,28 +1513,20 @@ out:
 		h_qp = (handle_t)wd_ctx_get_priv(config->ctxs[j].ctx);
 		hisi_qm_free_qp(h_qp);
 	}
-	free(priv);
 	return -WD_EINVAL;
 }
 
-static void hisi_zip_exit(struct wd_alg_driver *drv)
+static void hisi_zip_exit(void *priv)
 {
-	struct wd_ctx_config_internal *config;
-	struct hisi_zip_ctx *priv;
+	struct hisi_zip_ctx *zip_ctx = (struct hisi_zip_ctx *)priv;
+	struct wd_ctx_config_internal *config = &zip_ctx->config;
 	handle_t h_qp;
 	__u32 i;
 
-	if (!drv || !drv->priv)
-		return;
-
-	priv = (struct hisi_zip_ctx *)drv->priv;
-	config = &priv->config;
 	for (i = 0; i < config->ctx_num; i++) {
 		h_qp = (handle_t)wd_ctx_get_priv(config->ctxs[i].ctx);
 		hisi_qm_free_qp(h_qp);
 	}
-	free(priv);
-	drv->priv = NULL;
 }
 
 static int fill_zip_comp_sqe(struct hisi_qp *qp, struct wd_comp_msg *msg,
@@ -1593,7 +1581,7 @@ static int fill_zip_comp_sqe(struct hisi_qp *qp, struct wd_comp_msg *msg,
 	return 0;
 }
 
-static int hisi_zip_comp_send(struct wd_alg_driver *drv, handle_t ctx, void *comp_msg)
+static int hisi_zip_comp_send(handle_t ctx, void *comp_msg)
 {
 	struct hisi_qp *qp = wd_ctx_get_priv(ctx);
 	struct wd_comp_msg *msg = comp_msg;
@@ -1683,6 +1671,7 @@ static int parse_zip_sqe(struct hisi_qp *qp, struct hisi_zip_sqe *sqe,
 			 struct wd_comp_msg *msg)
 {
 	__u32 buf_type = (sqe->dw9 & HZ_BUF_TYPE_MASK) >> BUF_TYPE_SHIFT;
+	__u16 ctx_core_status = sqe->isize & HZ_CTX_CORE_STATUS_MASK;
 	__u32 ctx_win_len = sqe->ctx_dw2 & CTX_WIN_LEN_MASK;
 	__u16 ctx_st = sqe->ctx_dw0 & HZ_CTX_ST_MASK;
 	__u16 lstblk = sqe->dw3 & HZ_LSTBLK_MASK;
@@ -1743,6 +1732,18 @@ static int parse_zip_sqe(struct hisi_qp *qp, struct hisi_zip_sqe *sqe,
 		recv_msg->req.status = WD_EAGAIN;
 
 	/*
+	 * The ctx_core_status reflects the hardware context state.
+	 * In stateful decompression, if it is non-zero while neither
+	 * input is consumed nor output produced, the hardware
+	 * needs the request to be resent with more input and output,
+	 * so report WD_EAGAIN to the user.
+	 */
+	if (!recv_msg->req.status && recv_msg->stream_mode == WD_COMP_STATEFUL &&
+	    recv_msg->req.op_type == WD_DIR_DECOMPRESS && ctx_core_status &&
+	    !recv_msg->in_cons && !recv_msg->produced)
+		recv_msg->req.status = WD_EAGAIN;
+
+	/*
 	 * It need to analysis the data cache by hardware.
 	 * If the cache data is a complete huffman block,
 	 * the drv send WD_EAGAIN to user to continue
@@ -1785,7 +1786,7 @@ static int parse_zip_sqe(struct hisi_qp *qp, struct hisi_zip_sqe *sqe,
 	return 0;
 }
 
-static int hisi_zip_comp_recv(struct wd_alg_driver *drv, handle_t ctx, void *comp_msg)
+static int hisi_zip_comp_recv(handle_t ctx, void *comp_msg)
 {
 	struct hisi_qp *qp = wd_ctx_get_priv(ctx);
 	struct wd_comp_msg *recv_msg = comp_msg;
@@ -1838,7 +1839,7 @@ static int hisi_zip_get_usage(void *param)
 		return -WD_EINVAL;
 	}
 
-	priv = (struct hisi_zip_ctx *)drv->priv;
+	priv = (struct hisi_zip_ctx *)drv->drv_data;
 	if (!priv)
 		return -WD_EACCES;
 
@@ -1866,6 +1867,7 @@ static int hisi_zip_get_usage(void *param)
 	.alg_name = (zip_alg_name),\
 	.calc_type = UADK_ALG_HW,\
 	.priority = 100,\
+	.priv_size = sizeof(struct hisi_zip_ctx),\
 	.queue_num = ZIP_CTX_Q_NUM_DEF,\
 	.op_type_num = 2,\
 	.fallback = 0,\
@@ -1874,6 +1876,8 @@ static int hisi_zip_get_usage(void *param)
 	.send = hisi_zip_comp_send,\
 	.recv = hisi_zip_comp_recv,\
 	.get_usage = hisi_zip_get_usage, \
+	.alloc_ctx = wd_hw_alloc_ctx, \
+	.free_ctx = wd_hw_free_ctx, \
 }
 
 static struct wd_alg_driver zip_alg_driver[] = {

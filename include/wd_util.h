@@ -118,19 +118,8 @@ struct wd_ctx_attr {
 };
 
 struct wd_msg_handle {
-	int (*send)(struct wd_alg_driver *drv, handle_t ctx, void *drv_msg);
-	int (*recv)(struct wd_alg_driver *drv, handle_t ctx, void *drv_msg);
-};
-
-struct wd_init_attrs {
-	__u32 sched_type;
-	char alg[CRYPTO_MAX_ALG_NAME];
-	struct wd_alg_driver *driver;
-	struct wd_sched *sched;
-	struct wd_ctx_params *ctx_params;
-	struct wd_ctx_config *ctx_config;
-	wd_alg_init alg_init;
-	wd_alg_poll_ctx alg_poll_ctx;
+	int (*send)(handle_t sess, void *msg);
+	int (*recv)(handle_t sess, void *msg);
 };
 
 /*
@@ -345,7 +334,6 @@ int wd_set_epoll_en(const char *var_name, bool *epoll_en);
 
 /**
  * wd_handle_msg_sync() - recv msg from hardware
- * @drv: the driver to handle msg.
  * @msg_handle: callback of msg handle ops.
  * @ctx: the handle of context.
  * @msg: the msg of task.
@@ -354,8 +342,8 @@ int wd_set_epoll_en(const char *var_name, bool *epoll_en);
  *
  * Return 0 if successful or less than 0 otherwise.
  */
-int wd_handle_msg_sync(struct wd_alg_driver *drv, struct wd_msg_handle *msg_handle,
-		       handle_t ctx, void *msg, __u64 *balance, bool epoll_en);
+int wd_handle_msg_sync(struct wd_msg_handle *msg_handle, handle_t ctx,
+		void *msg, __u64 *balance, bool epoll_en);
 
 /**
  * wd_init_check() - Check input parameters for wd_<alg>_init.
@@ -414,7 +402,7 @@ static inline void wd_alg_clear_init(enum wd_status *status)
  *			to the obtained queue resource and the applied driver.
  * @ctx_params: wd_ctx_params to be initialized.
  * @user_ctx_params: user input wd_ctx_params.
- * @driver: device driver for the current algorithm application.
+ * @alg: Name of the algorithm.
  * @type: algorithm type.
  * @max_op_type: algorithm max operation type.
  *
@@ -422,8 +410,8 @@ static inline void wd_alg_clear_init(enum wd_status *status)
  */
 int wd_ctx_param_init(struct wd_ctx_params *ctx_params,
 		      struct wd_ctx_params *user_ctx_params,
-		      struct wd_alg_driver *driver,
-		      enum wd_type type, int max_op_type);
+		      char *alg, enum wd_type type,
+		      int max_op_type);
 
 void wd_ctx_param_uninit(struct wd_ctx_params *ctx_params);
 
@@ -438,28 +426,16 @@ int wd_alg_attrs_init(struct wd_init_attrs *attrs);
 void wd_alg_attrs_uninit(struct wd_init_attrs *attrs);
 
 /**
- * wd_alg_drv_bind() - Request the ctxs and initialize the sched_domain
- *                     with the given devices list, ctxs number and numa mask.
- * @task_type: the type of task specified by the current algorithm.
- * @alg_name: the name of the algorithm specified by the task.
- *
- * Return device driver if succeed and other NULL if fail.
- */
-struct wd_alg_driver *wd_alg_drv_bind(int task_type, const char *alg_name);
-void wd_alg_drv_unbind(struct wd_alg_driver *drv);
-
-/**
  * wd_alg_init_driver() - Initialize the current device driver according
  *			to the obtained queue resource and the applied driver.
  * @config: device resources requested by the current algorithm.
  * @driver: device driver for the current algorithm application.
+ * @drv_priv: the parameter pointer of the current device driver.
  *
  * Return 0 if succeed and other error number if fail.
  */
-int wd_alg_init_driver(struct wd_ctx_config_internal *config,
-		       struct wd_alg_driver *driver);
-void wd_alg_uninit_driver(struct wd_ctx_config_internal *config,
-			  struct wd_alg_driver *driver);
+int wd_alg_init_driver(struct wd_ctx_config_internal *config);
+void wd_alg_uninit_driver(struct wd_ctx_config_internal *config);
 
 /**
  * wd_dlopen_drv() - Open the dynamic library file of the device driver.
@@ -490,10 +466,16 @@ static inline void wd_dfx_msg_cnt(struct wd_ctx_config_internal *config,
 	bool ret;
 
 	ret = wd_need_info();
-	if (idx > numsize || !ret)
+	if (idx >= numsize || !ret)
+		return;
+
+	if (!config->msg_cnt)
 		return;
 
 	sqn = config->ctxs[idx].sqn;
+	if (sqn >= numsize)
+		return;
+
 	config->msg_cnt[sqn]++;
 }
 
@@ -521,6 +503,14 @@ static inline void wd_ctx_spin_unlock(struct wd_ctx_internal *ctx, int type)
 }
 
 int wd_mem_ops_init(handle_t h_ctx, struct wd_mm_ops *mm_ops, int mem_type);
+
+int  wd_alg_config_init(struct wd_init_attrs *attrs);
+void wd_alg_config_uninit(struct wd_init_attrs *attrs);
+int  wd_alg_ctx_init(struct wd_init_attrs *attrs);
+void wd_alg_ctx_uninit(struct wd_init_attrs *attrs);
+int  wd_ctx_bind_drivers(struct wd_ctx_config_internal *config_api,
+			struct wd_ctx_config_internal *config_in, int init_type);
+void wd_ctx_unbind_drivers(struct wd_ctx_config_internal *config);
 
 #ifdef __cplusplus
 }
